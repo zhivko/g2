@@ -2,7 +2,7 @@
  * help.h - collected help and assorted display routines
  * This file is part of the TinyG project
  *
- * Copyright (c) 2010 - 2013 Alden S. Hart, Jr.
+ * Copyright (c) 2010 - 2015 Alden S. Hart, Jr.
  *
  * This file ("the software") is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2 as published by the
@@ -20,31 +20,23 @@
 #ifndef HELP_H_ONCE
 #define HELP_H_ONCE
 
-#ifdef __cplusplus
-extern "C"{
-#endif
+#if defined(__TEXT_MODE) && defined(__HELP_SCREENS)
 
-#ifdef __HELP_SCREENS
-
-	stat_t help_general(cmdObj_t *cmd);
-	stat_t help_config(cmdObj_t *cmd);
-	stat_t help_test(cmdObj_t *cmd);
-	stat_t help_defa(cmdObj_t *cmd);
-	stat_t help_boot_loader(cmdObj_t *cmd);
+	stat_t help_general(nvObj_t *nv);
+	stat_t help_config(nvObj_t *nv);
+	stat_t help_test(nvObj_t *nv);
+	stat_t help_defa(nvObj_t *nv);
+	stat_t help_flash(nvObj_t *nv);
 
 #else
 
-	stat_t help_stub(cmdObj_t *cmd);
+	stat_t help_stub(nvObj_t *nv);
 	#define help_general help_stub
 	#define help_config help_stub
 	#define help_test help_stub
 	#define help_defa help_stub
-	#define help_boot_loader help_stub
+	#define help_flash help_stub
 
-#endif // __HELP_SCREENS
-
-#ifdef __cplusplus
-}
 #endif
 
 #endif // End of include guard: HELP_H_ONCE

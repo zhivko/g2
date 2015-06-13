@@ -2,7 +2,7 @@
  * util.h - a random assortment of useful functions
  * This file is part of the TinyG project
  *
- * Copyright (c) 2010 - 2013 Alden S. Hart, Jr.
+ * Copyright (c) 2010 - 2014 Alden S. Hart, Jr.
  *
  * This file ("the software") is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2 as published by the
@@ -24,10 +24,10 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
  * OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-/* util.c/.h contains a dog's breakfast of supporting functions that are 
+/* util.c/.h contains a dog's breakfast of supporting functions that are
  * not specific to tinyg: including:
  *
- *	  - math and min/max utilities and extensions 
+ *	  - math and min/max utilities and extensions
  *	  - vector manipulation utilities
  *	  - support for debugging routines
  */
@@ -36,39 +36,35 @@
 #define UTIL_H_ONCE
 
 #ifdef __ARM
-//#include <stdint.h>
+#include <stdint.h>
 //#include "sam.h"
 #include "MotateTimers.h"
 using Motate::delay;
 using Motate::SysTickTimer;
-#endif
 
-#ifdef __cplusplus
-extern "C"{
+#include <type_traits>
+#include <algorithm> // min, max
+#include <cmath> // isnan, isinf
+
 #endif
 
 /****** Global Scope Variables and Functions ******/
+
+//*** debug utilities ***
+
+void _debug_trap();
 
 //*** vector utilities ***
 
 extern float vector[AXES]; // vector of axes for passing to subroutines
 
-#define clear_vector(a) memset(a,0,sizeof(a))
+#define clear_vector(a) (memset(a,0,sizeof(a)))
+#define	copy_vector(d,s) (memcpy(d,s,sizeof(d)))
+
 float get_axis_vector_length(const float a[], const float b[]);
 uint8_t vector_equal(const float a[], const float b[]);
 float *set_vector(float x, float y, float z, float a, float b, float c);
 float *set_vector_by_axis(float value, uint8_t axis);
-//void copy_vector(float dst[], const float src[], uint8_t length);
-
-void copy_axis_vector(float dst[], const float src[]);
-/*
-#define copy_axis_vector(dst,src) ( dst[AXIS_X] = src[AXIS_X];\
-									dst[AXIS_Y] = src[AXIS_Y];\
-									dst[AXIS_Z] = src[AXIS_Z];\
-									dst[AXIS_A] = src[AXIS_A];\
-									dst[AXIS_B] = src[AXIS_B];\
-									dst[AXIS_C] = src[AXIS_C]; )
-*/
 
 //*** math utilities ***
 
@@ -84,9 +80,12 @@ float max4(float x1, float x2, float x3, float x4);
 //uint8_t * strcpy_U( uint8_t * dst, const uint8_t * src );
 //#endif
 
-uint8_t isnumber(char_t c);
-char_t *escape_string(char_t *dst, char_t *src);
-uint16_t compute_checksum(char_t const *string, const uint16_t length);
+uint8_t isnumber(char c);
+char *escape_string(char *dst, char *src);
+const char *pstr2str(const char *pgm_string);
+//int fntoa(char_t *str, float n, uint8_t precision);
+char fntoa(char *str, float n, uint8_t precision);
+uint16_t compute_checksum(char const *string, const uint16_t length);
 
 //*** other utilities ***
 
@@ -96,27 +95,19 @@ uint32_t SysTickTimer_getValue(void);
 
 //**** Math Support *****
 
-#ifndef square
-#define square(x) ((x)*(x))		/* UNSAFE */
-#endif
+// See http://www.cplusplus.com/doc/tutorial/namespaces/#using
 
-// side-effect safe forms of min and max
-#ifndef max
-#define max(a,b) \
-   ({ __typeof__ (a) termA = (a); \
-      __typeof__ (b) termB = (b); \
-	  termA>termB ? termA:termB; })
-#endif
+using std::isnan;
+using std::isinf;
+using std::min;
+using std::max;
 
-#ifndef min
-#define min(a,b) \
-	({ __typeof__ (a) term1 = (a); \
-	   __typeof__ (b) term2 = (b); \
-	   term1<term2 ? term1:term2; })
-#endif
+template <typename T>
+inline T square(const T x) { return (x)*(x); }		/* UNSAFE */
 
 #ifndef avg
-#define avg(a,b) ((a+b)/2)
+template <typename T>
+inline T avg(const T a,const T b) {return (a+b)/2; }
 #endif
 
 #ifndef EPSILON
@@ -147,19 +138,22 @@ uint32_t SysTickTimer_getValue(void);
 #define MAX_LONG (2147483647)
 #define MAX_ULONG (4294967295)
 #define MM_PER_INCH (25.4)
-#define INCH_PER_MM (1/25.4)
+#define INCHES_PER_MM (1/25.4)
 #define MICROSECONDS_PER_MINUTE ((float)60000000)
 #define uSec(a) ((float)(a * MICROSECONDS_PER_MINUTE))
 
 #define RADIAN (57.2957795)
-//		M_PI is pi as defined in math.h
-//		M_SQRT2 is radical2 as defined in math.h
-#ifndef M_SQRT3
-#define M_SQRT3 (1.73205080756888)
+
+#ifndef M_PI	// M_PI is pi usually defined in math.h, but not always (C++11)
+#define M_PI (3.14159265358979323846264338327950288)
 #endif
 
-#ifdef __cplusplus
-}
+#ifndef M_SQRT2 // M_SQRT2 is radical2 as defined in math.h
+#define M_SQRT2 (1.41421356237310)
+#endif
+
+#ifndef M_SQRT3
+#define M_SQRT3 (1.73205080756888)
 #endif
 
 #endif	// End of include guard: UTIL_H_ONCE

@@ -1,9 +1,9 @@
 /*
- * cycle_probing.cpp - probing cycle extension to canonical_machine.c
- * Part of TinyG2 project
+ * cycle_probing.c - probing cycle extension to canonical_machine.c
+ * Part of TinyG project
  *
- * Copyright (c) 2013 Rob Grzyck 
- * Copyright (c) 2010 - 2013 Alden S Hart, Jr.
+ * Copyright (c) 2010 - 2015 Alden S Hart, Jr., Sarah Tappon, Tom Cauchois, Robert Giseburt
+ * With contributions from Other Machine Company.
  *
  * This file ("the software") is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2 as published by the
@@ -26,415 +26,297 @@
  * OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 #include "tinyg2.h"
-#include "util.h"
 #include "config.h"
 #include "json_parser.h"
 #include "text_parser.h"
-#include "gcode_parser.h"
 #include "canonical_machine.h"
-#include "planner.h"
-#include "stepper.h"
+#include "spindle.h"
 #include "report.h"
-#include "switch.h"
-
-#ifdef __cplusplus
-extern "C"{
-#endif
+#include "gpio.h"
+#include "planner.h"
+#include "util.h"
 
 /**** Probe singleton structure ****/
 
-struct pbProbingSingleton {		// persistent homing runtime variables
+#define MINIMUM_PROBE_TRAVEL 0.254
+
+struct pbProbingSingleton {						// persistent probing runtime variables
+	stat_t (*func)();							// binding for callback function state machine
+
 	// controls for probing cycle
-	int8_t axis;				// axis currently being homed
-	uint8_t min_mode;			// mode for min switch fo this axis
-	uint8_t max_mode;			// mode for max switch fo this axis
-	int8_t homing_switch;		// homing switch for current axis (index into switch flag table)
-	int8_t limit_switch;		// limit switch for current axis, or -1 if none
-	uint8_t homing_closed;		// 0=open, 1=closed
-	uint8_t limit_closed;		// 0=open, 1=closed
-	uint8_t (*func)(int8_t axis);// binding for callback function state machine
-	float open_position;
-	
-	// per-axis parameters
-	float direction;			// set to 1 for positive (max), -1 for negative (to min);
-	float search_travel;		// signed distance to travel in search
-	float search_velocity;		// search speed as positive number
-	float latch_velocity;		// latch speed as positive number
-	float latch_backoff;		// max distance to back off switch during latch phase 
-	float zero_backoff;			// distance to back off switch before setting zero
-	float max_clear_backoff;	// maximum distance of switch clearing backoffs before erring out
+	uint8_t probe_input;						// which input should we check?
 
 	// state saved from gcode model
-	float saved_feed_rate;		// F setting
-	uint8_t saved_units_mode;	// G20,G21 global setting
-	uint8_t saved_coord_system;	// G54 - G59 setting
-	uint8_t saved_distance_mode;// G90,G91 global setting
-	float saved_jerk;			// saved and restored for each axis homed	
+	uint8_t saved_distance_mode;				// G90,G91 global setting
+	uint8_t saved_coord_system;					// G54 - G59 setting
+	float saved_jerk[AXES];						// saved and restored for each axis
+
+	// probe destination
+	float start_position[AXES];
+	float target[AXES];
+	float flags[AXES];
 };
 static struct pbProbingSingleton pb;
 
-
 /**** NOTE: global prototypes and other .h info is located in canonical_machine.h ****/
 
-static stat_t _set_pb_func(uint8_t (*func)(int8_t axis));
-static stat_t _probing_axis_start(int8_t axis);
-static stat_t _probing_axis_clear(int8_t axis);
-static stat_t _probing_axis_backoff_home(int8_t axis);
-static stat_t _probing_axis_backoff_limit(int8_t axis);
-static stat_t _probing_axis_search(int8_t axis);
-static stat_t _probing_axis_latch(int8_t axis);
-static stat_t _probing_axis_zero_backoff(int8_t axis);
-static stat_t _probing_axis_set_zero(int8_t axis);
-static stat_t _probing_axis_move(int8_t axis, float target, float velocity);
-static stat_t _probing_finalize_exit(int8_t axis);
+static stat_t _probing_init();
+static stat_t _probing_start();
+static stat_t _probing_backoff();
+static stat_t _probing_finish();
+static stat_t _probing_finalize_exit();
 static stat_t _probing_error_exit(int8_t axis);
-static int8_t _get_next_axis(int8_t axis);
 
 
-/*****************************************************************************
- * cm_probing_cycle_start()	- G28.1 homing cycle using limit switches
- * cm_probing_callback() 	- main loop callback for running the homing cycle
- *
- * Homing works from a G28.1 according to the following writeup: 
- *	https://github.com/synthetos/TinyG/wiki/TinyG-Homing-(version-0.95-and-above)
- *
- *	--- How does this work? ---
- *
- *	Homing is invoked using a G28.1 command with 1 or more axes specified in the
- *	command: e.g. g28.1 x0 y0 z0     (FYI: the number after each axis is irrelevant)
- *
- *	Homing is always run in the following order - for each enabeled axis:
- *	  Z,X,Y,A			Note: B and C cannot be homed
- *
- *	At the start of a homing cycle those switches configured for homing 
- *	(or for homing and limits) are treated as homing switches (they are modal).
- *
- *	After initialization the following sequence is run for each axis to be homed:
- *
- *	  0. If a homing or limit switch is closed on invocation, clear off the switch
- *	  1. Drive towards the homing switch at search velocity until switch is hit
- *	  2. Drive away from the homing switch at latch velocity until switch opens
- *	  3. Back off switch by the zero backoff distance and set zero for that axis
- *
- *	Homing works as a state machine that is driven by registering a callback 
- *	function at hm.func() for the next state to be run. Once the axis is 
- *	initialized each callback basically does two things (1) start the move 
- *	for the current function, and (2) register the next state with hm.func(). 
- *	When a move is started it will either be interrupted if the homing switch 
- *	changes state, This will cause the move to stop with a feedhold. The other 
- *	thing that can happen is the move will run to its full length if no switch 
- *	change is detected (hit or open),
- *
- *	Once all moves for an axis are complete the next axis in the sequence is homed
- *
- *	When a homing cycle is intiated the homing state is set to HOMING_NOT_HOMED
- *	When homing comples successfully this si set to HOMING_HOMED, otherwise it
- *	remains HOMING_NOT_HOMED.	
- */
-/*	--- Some further details ---
- *
- *	Note: When coding a cycle (like this one) you get to perform one queued 
- *	move per entry into the continuation, then you must exit. 
- *
- *	Another Note: When coding a cycle (like this one) you must wait until 
- *	the last move has actually been queued (or has finished) before declaring
- *	the cycle to be done. Otherwise there is a nasty race condition in the 
- *	tg_controller() that will accept the next command before the position of 
- *	the final move has been recorded in the Gcode model. That's what the call
- *	to cm_isbusy() is about.
+/**** HELPERS ***************************************************************************
+ * _set_pb_func() - a convenience for setting the next dispatch vector and exiting
  */
 
-uint8_t cm_probe_cycle_start(void)
-{
-	// save relevant non-axis parameters from Gcode model
-	pb.saved_units_mode = gm.units_mode;
-	pb.saved_coord_system = gm.coord_system;
-	pb.saved_distance_mode = gm.distance_mode;
-	pb.saved_feed_rate = gm.feed_rate;
-	
-	pb.open_position = 0;
-	
-	// set working values
-	cm_set_units_mode(MILLIMETERS);
-	cm_set_distance_mode(INCREMENTAL_MODE);
-	cm_set_coord_system(ABSOLUTE_COORDS);	// homing is done in machine coordinates
-
-	pb.axis = -1;							// set to retrieve initial axis
-	pb.func = _probing_axis_start; 			// bind initial processing function
-	cm.cycle_state = CYCLE_PROBE;
-	st_energize_motors();					// enable motors if not already enabled
-	return (STAT_OK);
-}
-
-uint8_t cm_probe_callback(void)
-{
-	if (cm.cycle_state != CYCLE_PROBE) { return (STAT_NOOP);}	// exit if not in a homing cycle
-	if (cm_get_runtime_busy() == true) { return (STAT_EAGAIN);}	// sync to planner move ends
-	return (pb.func(pb.axis));									// execute the current homing move
-}
-
-int8_t cm_probe_get_axis(void)
-{
-	return pb.axis;
-}
-
-void cm_probe_set_position(float p)
-{
-	pb.open_position = p;
-}
-
-
-static stat_t _probing_finalize_exit(int8_t axis)	// third part of return to home
-{
-	mp_flush_planner(); 						// should be stopped, but in case of switch closure
-	cm_set_coord_system(pb.saved_coord_system);	// restore to work coordinate system
-	cm_set_units_mode(pb.saved_units_mode);
-	cm_set_distance_mode(pb.saved_distance_mode);
-	cm_set_feed_rate(pb.saved_feed_rate);
-	cm_set_motion_mode(MODEL, MOTION_MODE_CANCEL_MOTION_MODE);
-//	cm.cycle_state = CYCLE_MACHINING;
-	cm.cycle_state = CYCLE_OFF;
-	cm_cycle_end();
-	return (STAT_OK);
-}
-
-
-/* 
- * _probing_error_exit()
- */
-
-static stat_t _probing_error_exit(int8_t axis)
-{
-	// Generate the warning message. Since the error exit returns via the homing callback 
-	// - and not the main controller - it requires its own display processing 
-	cmd_reset_list();
-	if (axis == -2) {
-		cmd_add_conditional_message((const char_t *)"*** WARNING *** Probing error: Specified axis(es) cannot use probe");
-	} else {
-		char message[CMD_MESSAGE_LEN];
-		sprintf_P(message, (const PROGMEM char *)("*** WARNING *** Probing error: %c axis settings misconfigured"), cm_get_axis_char(axis));
-		cmd_add_conditional_message((const char_t *)message);
-	}
-	cmd_print_list(STAT_PROBING_CYCLE_FAILED, TEXT_INLINE_VALUES, JSON_RESPONSE_FORMAT);
-
-	// clean up and exit
-	mp_flush_planner(); 						// should be stopped, but in case of switch closure
-												// don't use cm_request_queue_flush() here
-
-	cm_set_coord_system(pb.saved_coord_system);	// restore to work coordinate system
-	cm_set_units_mode(pb.saved_units_mode);
-	cm_set_distance_mode(pb.saved_distance_mode);
-	cm_set_feed_rate(pb.saved_feed_rate);
-	cm_set_motion_mode(MODEL, MOTION_MODE_CANCEL_MOTION_MODE);
-	cm.cycle_state = CYCLE_OFF;
-	cm_cycle_end();
-	return (STAT_PROBING_CYCLE_FAILED);
-}
-
-/* Homing axis moves - these execute in sequence for each axis
- *	_probing_axis_start()		- get next axis, initialize variables, call the clear
- *	_probing_axis_clear()		- initiate a clear to move off a switch that is thrown at the start
- *	_probing_axis_backoff_home()	- back off the cleared home switch
- *	_probing_axis_backoff_limit()- back off the cleared limit switch
- *	_probing_axis_search()		- fast search for switch, closes switch
- *	_probing_axis_latch()		- slow reverse until switch opens again
- *	_probing_axis_final()		- backoff from latch location to zero position 
- *	_probing_axis_move()			- helper that actually executes the above moves
- */
-
-static stat_t _probing_axis_start(int8_t axis)
-{
-	// get the first or next axis
-	if ((axis = _get_next_axis(axis)) < 0) { 				// axes are done or error
-		if (axis == -1) {									// -1 is done
-			return (_set_pb_func(_probing_finalize_exit));
-		} else if (axis == -2) { 							// -2 is error
-			cm_set_units_mode(pb.saved_units_mode);
-			cm_set_distance_mode(pb.saved_distance_mode);
-			cm.cycle_state = CYCLE_OFF;
-			cm_cycle_end();
-			return (_probing_error_exit(-2));
-		}
-	}
-	// trap gross mis-configurations
-//	if ((cm.a[axis].search_velocity == 0) || (cm.a[axis].latch_velocity == 0)) {
-	if ((fp_ZERO(cm.a[axis].search_velocity)) || (fp_ZERO(cm.a[axis].latch_velocity))) {
-		return (_probing_error_exit(axis));
-	}
-	if ((cm.a[axis].travel_max <= 0) || (cm.a[axis].latch_backoff <= 0)) {
-		return (_probing_error_exit(axis));
-	}
-
-	// determine the switch setup and that config is OK
-	pb.min_mode = get_switch_mode(MIN_SWITCH(axis));
-	pb.max_mode = get_switch_mode(MAX_SWITCH(axis));
-
-	if ( ((pb.min_mode & SW_HOMING_BIT) ^ (pb.max_mode & SW_HOMING_BIT)) == 0) {// one or the other must be homing
-		return (_probing_error_exit(axis));					// axis cannot be homed
-	}
-	pb.axis = axis;											// persist the axis
-	pb.search_velocity = fabs(cm.a[axis].search_velocity);	// search velocity is always positive
-	pb.latch_velocity = fabs(cm.a[axis].latch_velocity);	// latch velocity is always positive
-
-	// setup parameters homing to the minimum switch
-	if (pb.min_mode & SW_HOMING_BIT) {
-		pb.homing_switch = MIN_SWITCH(axis);				// the min is the homing switch
-		pb.limit_switch = MAX_SWITCH(axis);					// the max would be the limit switch
-		pb.search_travel = -cm.a[axis].travel_max;			// search travels in negative direction
-		pb.latch_backoff = cm.a[axis].latch_backoff;		// latch travels in positive direction
-		pb.zero_backoff = cm.a[axis].zero_backoff;
-
-	// setup parameters for positive travel (homing to the maximum switch)
-	} else {
-		pb.homing_switch = MAX_SWITCH(axis);				// the max is the homing switch
-		pb.limit_switch = MIN_SWITCH(axis);					// the min would be the limit switch
-		pb.search_travel = cm.a[axis].travel_max;			// search travels in positive direction
-		pb.latch_backoff = -cm.a[axis].latch_backoff;		// latch travels in negative direction
-		pb.zero_backoff = -cm.a[axis].zero_backoff;
-	}
-    // if homing is disabled for the axis then skip to the next axis
-	uint8_t sw_mode = get_switch_mode(pb.homing_switch);
-	if ((sw_mode != SW_MODE_HOMING) && (sw_mode != SW_MODE_HOMING_LIMIT)) {
-		return (_set_pb_func(_probing_axis_start));
-	}
-	// disable the limit switch parameter if there is no limit switch
-	if (get_switch_mode(pb.limit_switch) == SW_MODE_DISABLED) {
-		pb.limit_switch = -1;
-	}
-	pb.saved_jerk = cm.a[axis].jerk_max;					// save the max jerk value
-	return (_set_pb_func(_probing_axis_clear));				// start the clear
-}
-
-// Handle an initial switch closure by backing off switches
-// NOTE: Relies on independent switches per axis (not shared)
-static stat_t _probing_axis_clear(int8_t axis)				// first clear move
-{
-//+++++	int8_t homing = read_switch(pb.homing_switch);
-//+++++	int8_t limit = read_switch(pb.limit_switch);
-	int8_t homing = SW_OPEN;
-	int8_t limit = SW_OPEN;
-
-	if ((homing == SW_OPEN) && (limit != SW_CLOSED)) {
- 		return (_set_pb_func(_probing_axis_search));		// OK to start the search
-	}
-	if (homing == SW_CLOSED) {
-		_probing_axis_move(axis, pb.latch_backoff, pb.search_velocity);
- 		return (_set_pb_func(_probing_axis_backoff_home));	// will backoff homing switch some more
-	}
-	_probing_axis_move(axis, -pb.latch_backoff, pb.search_velocity);
- 	return (_set_pb_func(_probing_axis_backoff_limit));		// will backoff limit switch some more
-}
-
-static stat_t _probing_axis_backoff_home(int8_t axis)		// back off cleared homing switch
-{
-	_probing_axis_move(axis, pb.latch_backoff, pb.search_velocity);
-    return (_set_pb_func(_probing_axis_search));
-}
-
-static stat_t _probing_axis_backoff_limit(int8_t axis)		// back off cleared limit switch
-{
-	_probing_axis_move(axis, -pb.latch_backoff, pb.search_velocity);
-    return (_set_pb_func(_probing_axis_search));
-}
-
-static stat_t _probing_axis_search(int8_t axis)				// start the search
-{
-	cm.a[axis].jerk_max = cm.a[axis].jerk_homing;	// use the homing jerk for search onward
-	_probing_axis_move(axis, pb.search_travel, pb.search_velocity);
-    return (_set_pb_func(_probing_axis_latch));
-}
-
-static stat_t _probing_axis_latch(int8_t axis)				// latch to switch open
-{
-	_probing_axis_move(axis, pb.latch_backoff, pb.latch_velocity);    
-	return (_set_pb_func(_probing_axis_zero_backoff)); 
-}
-
-static stat_t _probing_axis_zero_backoff(int8_t axis)		// backoff to zero position
-{
-	_probing_axis_move(axis, pb.zero_backoff, pb.search_velocity);
-	return (_set_pb_func(_probing_axis_set_zero));
-}
-
-static stat_t _probing_axis_set_zero(int8_t axis)			// set zero and finish up
-{
-	cm.a[axis].jerk_max = pb.saved_jerk;					// restore the max jerk value
-	//cm.homed[axis] = true;
-	return (_set_pb_func(_probing_axis_start));
-}
-
-static stat_t _probing_axis_move(int8_t axis, float target, float velocity)
-{
-	float flags[] = {1,1,1,1,1,1};
-	set_vector_by_axis(target, axis);
-	cm_set_feed_rate(velocity);
-	cm_request_queue_flush();
-	cm_request_cycle_start();
-	ritorno(cm_straight_feed(vector, flags));
-	return (STAT_EAGAIN);
-}
-
-/* _run_homing_dual_axis() - kernal routine for running homing on a dual axis */
-//static stat_t _run_homing_dual_axis(int8_t axis) { return (STAT_OK);}
-
-/**** HELPERS ****************************************************************/
-/*
- * _set_hm_func() - a convenience for setting the next dispatch vector and exiting
- */
-
-uint8_t _set_pb_func(uint8_t (*func)(int8_t axis))
+static stat_t _set_pb_func(uint8_t (*func)())
 {
 	pb.func = func;
 	return (STAT_EAGAIN);
 }
 
-/*
- * _get_next_axis() - return next axis in sequence based on axis in arg
+/***********************************************************************************
+ **** G38.2 Probing Cycle ***********************************************************
+ ***********************************************************************************/
+
+/****************************************************************************************
+ * cm_probing_cycle_start()		- G38.2 homing cycle using limit switches
+ * cm_probing_cycle_callback()	- main loop callback for running the probing cycle
  *
- *	Accepts "axis" arg as the current axis; or -1 to retrieve the first axis
- *	Returns next axis based on "axis" argument and if that axis is flagged for homing in the gf struct
- *	Returns -1 when all axes have been processed
- *	Returns -2 if no axes are specified (Gcode calling error)
- *	Homes Z first, then the rest in sequence
+ *	All cm_probe_cycle_start does is prevent any new commands from queueing to the
+ *	planner so that the planner can move to a stop and report MACHINE_PROGRAM_STOP.
+ *	OK, it also queues the function that's called once motion has stopped.
  *
- *	Isolating this function facilitates implementing more complex and 
- *	user-specified axis homing orders
+ *  NOTE: it is *not* an error condition for the probe not to trigger.
+ *  it is an error for the limit or homing switches to fire, or for some other
+ *  configuration error.
+ *
+ *	--- Some further details ---
+ *
+ *	Note: When coding a cycle (like this one) you get to perform one queued
+ *	move per entry into the continuation, then you must exit.
+ *
+ *	Another Note: When coding a cycle (like this one) you must wait until
+ *	the last move has actually been queued (or has finished) before declaring
+ *	the cycle to be done. Otherwise there is a nasty race condition in
+ *	_controller_HSM() that may accept the next command before the position of
+ *	the final move has been recorded in the Gcode model. That's what the call
+ *	to cm_get_runtime_busy() is about.
  */
 
-int8_t _get_next_axis(int8_t axis)
+uint8_t cm_straight_probe(float target[], float flags[])
 {
-	if (axis == -1) {	// inelegant brute force solution
-		if (fp_TRUE(gf.target[AXIS_Z])) return (AXIS_Z);
-		if (fp_TRUE(gf.target[AXIS_X])) return (AXIS_X);
-		if (fp_TRUE(gf.target[AXIS_Y])) return (AXIS_Y);
-		if (fp_TRUE(gf.target[AXIS_A])) return (AXIS_A);
-//		if (fp_TRUE(gf.target[AXIS_B])) return (AXIS_B);
-//		if (fp_TRUE(gf.target[AXIS_C])) return (AXIS_C);
-		return (-2);	// error
-	} else if (axis == AXIS_Z) {
-		if (fp_TRUE(gf.target[AXIS_X])) return (AXIS_X);
-		if (fp_TRUE(gf.target[AXIS_Y])) return (AXIS_Y);
-		if (fp_TRUE(gf.target[AXIS_A])) return (AXIS_A);
-//		if (fp_TRUE(gf.target[AXIS_B])) return (AXIS_B);
-//		if (fp_TRUE(gf.target[AXIS_C])) return (AXIS_C);
-	} else if (axis == AXIS_X) {
-		if (fp_TRUE(gf.target[AXIS_Y])) return (AXIS_Y);
-		if (fp_TRUE(gf.target[AXIS_A])) return (AXIS_A);
-//		if (fp_TRUE(gf.target[AXIS_B])) return (AXIS_B);
-//		if (fp_TRUE(gf.target[AXIS_C])) return (AXIS_C);
-	} else if (axis == AXIS_Y) {
-		if (fp_TRUE(gf.target[AXIS_A])) return (AXIS_A);
-//		if (fp_TRUE(gf.target[AXIS_B])) return (AXIS_B);
-//		if (fp_TRUE(gf.target[AXIS_C])) return (AXIS_C);
-//	} else if (axis == AXIS_A) {
-//		if (fp_TRUE(gf.target[AXIS_B])) return (AXIS_B);
-//		if (fp_TRUE(gf.target[AXIS_C])) return (AXIS_C);
-//	} else if (axis == AXIS_B) {
-//		if (fp_TRUE(gf.target[AXIS_C])) return (AXIS_C);
-	}
-	return (-1);	// done
+    // trap zero feed rate condition
+    if ((cm.gm.feed_rate_mode != INVERSE_TIME_MODE) && (fp_ZERO(cm.gm.feed_rate))) {
+        return (STAT_GCODE_FEEDRATE_NOT_SPECIFIED);
+    }
+
+    // error if no axes specified
+    if (fp_NOT_ZERO(flags[AXIS_X]) && fp_NOT_ZERO(flags[AXIS_Y]) && fp_NOT_ZERO(flags[AXIS_Z])) {
+        return (STAT_GCODE_AXIS_IS_MISSING);
+    }
+
+    // set probe move endpoint
+    copy_vector(pb.target, target);     // set probe move endpoint
+    copy_vector(pb.flags, flags);       // set axes involved on the move
+    clear_vector(cm.probe_results);     // clear the old probe position.
+    // NOTE: relying on probe_result will not detect a probe to 0,0,0.
+
+    cm.probe_state = PROBE_WAITING;     // wait until planner queue empties before completing initialization
+    pb.func = _probing_init;            // bind probing initialization function
+    return (STAT_OK);
 }
 
-#ifdef __cplusplus
+uint8_t cm_probing_cycle_callback(void)
+{
+    if ((cm.cycle_state != CYCLE_PROBE) && (cm.probe_state != PROBE_WAITING)) {
+        return (STAT_NOOP);         // exit if not in a probe cycle or waiting for one
+    }
+	if (cm_get_runtime_busy()) return (STAT_EAGAIN);    // sync to planner move ends
+	return (pb.func());                                 // execute the current probing move
 }
-#endif
+
+/*
+ * _probing_init()	- G38.2 probing cycle using limit switches
+ *
+ *	These initializations are required before starting the probing cycle.
+ *	They must be done after the planner has exhausted all current CYCLE moves as
+ *	they affect the runtime (specifically the switch modes). Side effects would
+ *	include limit switches initiating probe actions instead of just killing movement
+ */
+
+static uint8_t _probing_init()
+{
+    // so optimistic... ;)
+    // NOTE: it is *not* an error condition for the probe not to trigger.
+    // it is an error for the limit or homing switches to fire, or for some other configuration error.
+    cm.probe_state = PROBE_FAILED;
+    cm.machine_state = MACHINE_CYCLE;
+    cm.cycle_state = CYCLE_PROBE;
+
+    // save relevant non-axis parameters from Gcode model
+    pb.saved_coord_system = cm_get_coord_system(ACTIVE_MODEL);
+    pb.saved_distance_mode = cm_get_distance_mode(ACTIVE_MODEL);
+
+    // set working values
+    cm_set_distance_mode(ABSOLUTE_MODE);
+    cm_set_coord_system(ABSOLUTE_COORDS);   // probing is done in machine coordinates
+
+    // initialize the axes - save the jerk settings & switch to the jerk_homing settings
+    for( uint8_t axis=0; axis<AXES; axis++ ) {
+        pb.saved_jerk[axis] = cm_get_axis_jerk(axis);	// save the max jerk value
+        cm_set_axis_jerk(axis, cm.a[axis].jerk_high);	// use the high-speed jerk for probe
+        pb.start_position[axis] = cm_get_absolute_position(ACTIVE_MODEL, axis);
+    }
+
+    // error if the probe target is too close to the current position
+    if (get_axis_vector_length(pb.start_position, pb.target) < MINIMUM_PROBE_TRAVEL) {
+        _probing_error_exit(-2);
+    }
+
+	// error if the probe target requires a move along the A/B/C axes
+	for ( uint8_t axis=AXIS_A; axis<AXES; axis++ ) {
+		if (fp_NE(pb.start_position[axis], pb.target[axis])) {
+			_probing_error_exit(axis);
+        }
+	}
+
+	// initialize the probe switch
+
+    // Get the probe input
+    // TODO -- for now we hard code it to zmin
+    pb.probe_input = 5;
+
+    // Set the input into probing mode
+    gpio_set_probing_mode(pb.probe_input, true);
+	cm_spindle_control(SPINDLE_OFF);
+	return (_set_pb_func(_probing_start));							// start the move
+}
+
+/*
+ * _probing_start()
+ */
+
+static stat_t _probing_start()
+{
+	// initial probe state, don't probe if we're already contacted!
+    int8_t probe = gpio_read_input(pb.probe_input);
+
+    // false is SW_OPEN in old code, and INPUT_INACTIVE in new
+	if ( probe == INPUT_INACTIVE ) {
+		cm_straight_feed(pb.target, pb.flags);
+        return (_set_pb_func(_probing_backoff));
+	}
+
+    cm.probe_state = PROBE_SUCCEEDED;
+    return (_set_pb_func(_probing_finish));
+}
+
+/*
+ * _probing_backoff()
+ */
+static stat_t _probing_backoff()
+{
+    // If we've contacted, back off & then record position
+    int8_t probe = gpio_read_input(pb.probe_input);
+
+    /* true is SW_CLOSED in old code, and INPUT_ACTIVE in new */
+    if (probe == INPUT_ACTIVE) {
+        cm.probe_state = PROBE_SUCCEEDED;
+    //  FIXME: this should be its own parameter
+    //  cm_set_feed_rate(cm.a[AXIS_Z].latch_velocity);
+        cm_straight_feed(pb.start_position, pb.flags);
+        return (_set_pb_func(_probing_finish));
+    } else {
+        cm.probe_state = PROBE_FAILED;
+        return (_set_pb_func(_probing_finish));
+    }
+}
+
+/*
+ * _probing_finish()
+ */
+
+static stat_t _probing_finish()
+{
+    int8_t probe = gpio_read_input(pb.probe_input);
+	cm.probe_state = (probe==true) ? PROBE_SUCCEEDED : PROBE_FAILED;
+
+	for (uint8_t axis=0; axis<AXES; axis++ ) {
+		// if we got here because of a feed hold we need to keep the model position correct
+		cm_set_position(axis, cm_get_work_position(RUNTIME, axis));
+
+		// store the probe results
+		cm.probe_results[axis] = cm_get_absolute_position(ACTIVE_MODEL, axis);
+	}
+
+	// If probe was successful the 'e' word == 1, otherwise e == 0 to signal an error
+	printf_P(PSTR("{\"prb\":{\"e\":%i"), (int)cm.probe_state);
+	if (fp_TRUE(pb.flags[AXIS_X])) printf_P(PSTR(",\"x\":%0.3f"), cm.probe_results[AXIS_X]);
+	if (fp_TRUE(pb.flags[AXIS_Y])) printf_P(PSTR(",\"y\":%0.3f"), cm.probe_results[AXIS_Y]);
+	if (fp_TRUE(pb.flags[AXIS_Z])) printf_P(PSTR(",\"z\":%0.3f"), cm.probe_results[AXIS_Z]);
+	if (fp_TRUE(pb.flags[AXIS_A])) printf_P(PSTR(",\"a\":%0.3f"), cm.probe_results[AXIS_A]);
+	if (fp_TRUE(pb.flags[AXIS_B])) printf_P(PSTR(",\"b\":%0.3f"), cm.probe_results[AXIS_B]);
+	if (fp_TRUE(pb.flags[AXIS_C])) printf_P(PSTR(",\"c\":%0.3f"), cm.probe_results[AXIS_C]);
+	printf_P(PSTR("}}\n"));
+
+	return (_set_pb_func(_probing_finalize_exit));
+}
+
+/*
+ * _probe_restore_settings()
+ * _probing_finalize_exit()
+ * _probing_error_exit()
+ */
+
+static void _probe_restore_settings()
+{
+	mp_flush_planner();
+//	if (cm.hold_state == FEEDHOLD_HOLD);
+//		cm_end_hold();
+    cm_end_hold();                                          // ends hold if on is in effect
+
+    gpio_set_probing_mode(pb.probe_input, false);
+
+	// restore axis jerk
+	for (uint8_t axis=0; axis<AXES; axis++) {
+		cm.a[axis].jerk_max = pb.saved_jerk[axis];
+    }
+
+	// restore coordinate system and distance mode
+	cm_set_coord_system(pb.saved_coord_system);
+	cm_set_distance_mode(pb.saved_distance_mode);
+
+	// update the model with actual position
+	cm_set_motion_mode(MODEL, MOTION_MODE_CANCEL_MOTION_MODE);
+	cm_canned_cycle_end();
+}
+
+static stat_t _probing_finalize_exit()
+{
+	_probe_restore_settings();
+	return (STAT_OK);
+}
+
+static stat_t _probing_error_exit(int8_t axis)
+{
+	// Generate the warning message. Since the error exit returns via the probing callback
+	// - and not the main controller - it requires its own display processing
+	nv_reset_nv_list();
+	if (axis == -2) {
+		nv_add_conditional_message((const char *)"Probing error - invalid probe destination");
+	} else {
+		char msg[NV_MESSAGE_LEN];
+		sprintf_P(msg, PSTR("Probing error - %c axis cannot move during probing"), cm_get_axis_char(axis));
+//		nv_add_conditional_message((char *)msg);
+		nv_add_conditional_message(msg);
+	}
+	nv_print_list(STAT_PROBE_CYCLE_FAILED, TEXT_INLINE_VALUES, JSON_RESPONSE_FORMAT);
+
+	// clean up and exit
+	_probe_restore_settings();
+	return (STAT_PROBE_CYCLE_FAILED);
+}

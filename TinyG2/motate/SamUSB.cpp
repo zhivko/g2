@@ -37,12 +37,10 @@
 uint16_t endpointSizes[10] = {64, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
 namespace Motate {
-
-	const USBDeviceSpeed_t USBDeviceSpeed = kUSBDeviceHighSpeed;
-
 	const uint16_t MOTATE_USBLanguageString[] = {0x0409}; // English
 	const uint16_t *getUSBLanguageString(int16_t &length) {
-		length = sizeof(MOTATE_USBLanguageString);
+//		length = sizeof(MOTATE_USBLanguageString);
+        length = 2;
 		return MOTATE_USBLanguageString;
 	}
 
@@ -111,10 +109,22 @@ namespace Motate {
 					config = (config & ~kEndpointBufferBlocksMask) | kEndpointBufferBlocksUpTo2;
 			}
 		}
-		config |= UOTGHS_DEVEPTCFG_NBTRANS_1_TRANS | UOTGHS_DEVEPTCFG_ALLOC;
+
+        if (config & kEndpointTypeInterrupt) {
+            if (config & kEndpointBufferBlocks1) {
+                config |= UOTGHS_DEVEPTCFG_NBTRANS_1_TRANS;
+            } else if (config & kEndpointBufferBlocksUpTo2) {
+                config |= UOTGHS_DEVEPTCFG_NBTRANS_2_TRANS;
+            } else if (config & kEndpointBufferBlocksUpTo3) {
+                config |= UOTGHS_DEVEPTCFG_NBTRANS_3_TRANS;
+            }
+        }
+
+		config |= UOTGHS_DEVEPTCFG_ALLOC;
 
 		return config;
 	};
+    
 
 	inline void _setEndpointConfiguration(const uint8_t endpoint, uint32_t configuration) {
 		UOTGHS->UOTGHS_DEVEPTCFG[endpoint] = configuration;
@@ -128,6 +138,8 @@ namespace Motate {
 		UOTGHS->UOTGHS_DEVEPT |= UOTGHS_DEVEPT_EPEN0 << (endpoint);
 	}
 
+	inline void _enableOverflowInterrupt(const uint8_t endpoint) { UOTGHS->UOTGHS_DEVEPTIER[endpoint] = UOTGHS_DEVEPTIER_OVERFES; }
+
 	void _initEndpoint(uint32_t endpoint, const uint32_t configuration) {
 		endpoint = endpoint & 0xF; // EP range is 0..9, hence mask is 0xF.
 
@@ -137,6 +149,11 @@ namespace Motate {
 		// Configure EP
 		// If we get here, and it's a null endpoint, this will disable it.
 		_setEndpointConfiguration(endpoint, configuration_fixed);
+
+        // Enable overflow interrupt for OUT (Rx) endpoints
+        if (endpoint > 0 && (configuration & UOTGHS_DEVEPTCFG_EPDIR)==0) {
+            _enableOverflowInterrupt(endpoint);
+        }
 		
 		// Enable EP
 		if (configuration_fixed != kEndpointBufferNull) {
@@ -144,9 +161,15 @@ namespace Motate {
 
 			if (!_isEndpointConfigOK(endpoint)) {
 	//			TRACE_UOTGHS_DEVICE(printf("=> UDD_InitEP : ERROR FAILED TO INIT EP %lu\r\n", ul_ep_nb);)
-				while(1);
+				while(1) {
+                    ;
+                }
 			}
-		}
+		} else {
+            while(1) {
+                ;
+            }
+        }
 
 		// Is this necessary? -Rob
 		_resetEndpointBuffer(endpoint);
@@ -169,7 +192,7 @@ namespace Motate {
 	inline int32_t _getEndpointBufferCount(const uint8_t endpoint) {
 		return ((UOTGHS->UOTGHS_DEVEPTISR[endpoint] & UOTGHS_DEVEPTISR_BYCT_Msk) >> UOTGHS_DEVEPTISR_BYCT_Pos);
 	}
-
+    
 	// A few inline helpers, mainly for readability
 	//  Set and test interrupts
 	bool _inAResetInterrupt() { return (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_EORST) != 0; }
@@ -187,7 +210,57 @@ namespace Motate {
 	
 	// Endpoint interrupts, and subinterrupts (!)
 	inline bool _inAnEndpointInterrupt(const uint8_t endpoint) { return (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_0 << (endpoint)) != 0; }
-	// Cleared automatically after the ISR fires
+	inline bool _inAnEndpointInterruptNotControl() { return (UOTGHS->UOTGHS_DEVISR & (UOTGHS_DEVISR_PEP_1|UOTGHS_DEVISR_PEP_2|UOTGHS_DEVISR_PEP_3|UOTGHS_DEVISR_PEP_4|UOTGHS_DEVISR_PEP_5|UOTGHS_DEVISR_PEP_6|UOTGHS_DEVISR_PEP_7|UOTGHS_DEVISR_PEP_8|UOTGHS_DEVISR_PEP_9)) != 0; }
+    inline const uint8_t _firstEndpointOfInterrupt() {
+        if (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_1) { return 1; }
+        if (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_2) { return 2; }
+        if (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_3) { return 3; }
+        if (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_4) { return 4; }
+        if (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_5) { return 5; }
+        if (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_6) { return 6; }
+        if (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_7) { return 7; }
+        if (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_8) { return 8; }
+        if (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_9) { return 9; }
+        return 0;
+    }
+
+	inline bool _inAnOverflowInterrupt(const uint8_t endpoint) { return (UOTGHS->UOTGHS_DEVEPTISR[endpoint] & UOTGHS_DEVEPTISR_OVERFI) != 0; }
+
+    inline bool _isAControlEnpointInterrupted(const uint8_t endpoint, bool &keepGoing) {
+        if (UOTGHS->UOTGHS_DEVISR & UOTGHS_DEVISR_PEP_0 << endpoint) {
+            keepGoing = false;
+            if (UOTGHS->UOTGHS_DEVEPTCFG[endpoint] & kEndpointTypeControl) {
+                return true;
+            }
+            else {
+                return false;
+            }
+        }
+        keepGoing = true;
+        return false;
+    }
+    
+    // Pass in a uint8_t to have the enpoint number set in.
+    inline bool _inAControlEndpointInterrupt(uint8_t &endpoint_found) {
+        bool keepGoing = true;
+        
+        // The optimizer should clean this up quite a bit...
+        if (             _isAControlEnpointInterrupted(0, keepGoing)) { endpoint_found = 0; return true; }
+        if (keepGoing && _isAControlEnpointInterrupted(1, keepGoing)) { endpoint_found = 1; return true; }
+        if (keepGoing && _isAControlEnpointInterrupted(2, keepGoing)) { endpoint_found = 2; return true; }
+        if (keepGoing && _isAControlEnpointInterrupted(3, keepGoing)) { endpoint_found = 3; return true; }
+        if (keepGoing && _isAControlEnpointInterrupted(4, keepGoing)) { endpoint_found = 4; return true; }
+        if (keepGoing && _isAControlEnpointInterrupted(5, keepGoing)) { endpoint_found = 5; return true; }
+        if (keepGoing && _isAControlEnpointInterrupted(6, keepGoing)) { endpoint_found = 6; return true; }
+        if (keepGoing && _isAControlEnpointInterrupted(7, keepGoing)) { endpoint_found = 7; return true; }
+        if (keepGoing && _isAControlEnpointInterrupted(8, keepGoing)) { endpoint_found = 8; return true; }
+        if (keepGoing && _isAControlEnpointInterrupted(9, keepGoing)) { endpoint_found = 9; return true; }
+        
+        return false;
+    }
+
+    
+    // Cleared automatically after the ISR fires
 	inline void _enableEndpointInterrupt(const uint8_t endpoint) { UOTGHS->UOTGHS_DEVIER = UOTGHS_DEVIER_PEP_0 << (endpoint); }
 	inline void _disableEndpointInterrupt(const uint8_t endpoint) { UOTGHS->UOTGHS_DEVIDR = UOTGHS_DEVIDR_PEP_0 << (endpoint); }
 	inline bool _isEndpointInterruptEnabled(const uint8_t endpoint) { return (UOTGHS->UOTGHS_DEVIMR & UOTGHS_DEVIMR_PEP_0 << (endpoint)) != 0; }
@@ -248,10 +321,20 @@ namespace Motate {
 		return (UOTGHS->UOTGHS_DEVEPTISR[endpoint] & UOTGHS_DEVEPTISR_RWALL) != 0;
 	}
 
-	inline void _waitForTransmitINAvailable(const uint8_t endpoint) {
+	inline void _waitForTransmitINAvailable(const uint8_t endpoint, bool reset_needed = false) {
 		while (!(UOTGHS->UOTGHS_DEVEPTISR[endpoint] & UOTGHS_DEVEPTISR_TXINI))
-			;
-		_resetEndpointBuffer(endpoint);
+			reset_needed = true;
+
+        if (reset_needed)
+            _resetEndpointBuffer(endpoint);
+	}
+
+    inline void _waitForReceiveOUTAvailable(const uint8_t endpoint, bool reset_needed = false) {
+		while (!(UOTGHS->UOTGHS_DEVEPTISR[endpoint] & UOTGHS_DEVEPTISR_RXOUTI))
+			reset_needed = true;
+        
+        if (reset_needed)
+            _resetEndpointBuffer(endpoint);
 	}
 
 	inline void _clearTransmitIN(const uint8_t endpoint) {
@@ -269,8 +352,8 @@ namespace Motate {
 	// Acknowledges
 	inline void _ackReset() { UOTGHS->UOTGHS_DEVICR = UOTGHS_DEVICR_EORSTC; }
 	inline void _ackStartOfFrame() { UOTGHS->UOTGHS_DEVICR = UOTGHS_DEVICR_SOFC; }
-	inline void _ackOutRecieved(uint8_t endpoint) { UOTGHS->UOTGHS_DEVEPTICR[endpoint] = UOTGHS_DEVEPTICR_RXOUTIC; }
-	inline void _ackFIFOControl(uint8_t endpoint) { UOTGHS->UOTGHS_DEVEPTIDR[endpoint] = UOTGHS_DEVEPTIDR_FIFOCONC; }
+//	inline void _ackOutRecieved(uint8_t endpoint) { UOTGHS->UOTGHS_DEVEPTICR[endpoint] = UOTGHS_DEVEPTICR_RXOUTIC; }
+//	inline void _ackFIFOControl(uint8_t endpoint) { UOTGHS->UOTGHS_DEVEPTIDR[endpoint] = UOTGHS_DEVEPTIDR_FIFOCONC; }
 
 
 
@@ -278,9 +361,12 @@ namespace Motate {
 	 *  * There is no ping-pong mode.
 	 *  * The RWALL (Read/Write ALLowed) bit and the FIFOCON (FIFO CONtrol) are ignored and read zero.
 	 */
-	int16_t _readFromControlEndpoint(const uint8_t endpoint, uint8_t* data, int16_t len) {
-		//		_resetEndpointBuffer(endpoint);
+	int16_t _readFromControlEndpoint(const uint8_t endpoint, uint8_t* data, int16_t len, bool continuation) {
 		uint8_t *ptr_dest = data;
+        
+        if (!_inAReceivedSetupInterrupt(0))
+            _waitForReceiveOUTAvailable(endpoint, continuation);
+        
 		int16_t available = _getEndpointBufferCount(endpoint);
 
 		// If there's nothing to read, return -1
@@ -293,18 +379,25 @@ namespace Motate {
 		while (i--)
 			*ptr_dest++ = *_endpointBuffer[endpoint]++;
 
+        if (_getEndpointBufferCount(endpoint) == 0) {
+			_clearReceiveOUT(endpoint);
+			_resetEndpointBuffer(endpoint);
+		}
+
 		return to_read;
 	}
 
-	int16_t _sendToControlEndpoint(const uint8_t endpoint, const uint8_t* data, int16_t length) {
+	int16_t _sendToControlEndpoint(const uint8_t endpoint, const uint8_t* data, int16_t length, bool continuation) {
 		const uint8_t *ptr_src = data;
 
-		if (!_isTransmitINAvailable(endpoint))
-			return 0;
+		_waitForTransmitINAvailable(endpoint, /*reset_needed = */continuation);
 
 		int16_t to_send = endpointSizes[endpoint] - _getEndpointBufferCount(endpoint);
 		if (to_send > length)
 			to_send = length;
+        
+        // We return how much we sent...
+        length = to_send;
 
 		if (to_send == 0)
 			return 0;
@@ -319,7 +412,7 @@ namespace Motate {
 			_clearTransmitIN(endpoint);
 			_resetEndpointBuffer(endpoint);
 		}
-		return to_send;
+		return length;
 	}
 
 	// Returns -1 if nothing was available.
@@ -329,7 +422,7 @@ namespace Motate {
 		while (_isFIFOControlAvailable(endpoint)) {
 			if (!_isReadWriteAllowed(endpoint)) {
 				// We cheat and lazily clear the RXOUT interrupt.
-				// Once we might actually use that interru;t, we might need to be more proactive.
+				// Once we might actually use that interrupt, we might need to be more proactive.
 				_clearReceiveOUT(endpoint);
 
 				// Clearing FIFOCon will also mark this bank as "read".
@@ -346,61 +439,71 @@ namespace Motate {
 		return -1;
 	}
 
-	int16_t _readFromEndpoint(const uint8_t endpoint, uint8_t* data, int16_t length) {
-		//		_resetEndpointBuffer(endpoint);
-		uint8_t *ptr_dest = data;
-		int16_t read = 0;
+//     int16_t _readFromEndpoint(const uint8_t endpoint, uint8_t* data, int16_t length) {
+//             //              _resetEndpointBuffer(endpoint);
+//             uint8_t *ptr_dest = data;
+//             int16_t read = 0;
+//
+//             // Available = -1 means that FIFOCONtrol might not be high.
+//             // It should only be >= 0 once we've proven that it is.
+//             int16_t available = -1;
+//
+//             while (length > 0 && _isFIFOControlAvailable(endpoint)) {
+//                     available = _getEndpointBufferCount(endpoint);
+//
+//                     if (!available) {
+//                             // We cheat and lazily clear the RXOUT interrupt.
+//                             // Once we might actually use that interru;t, we might need to be more proactive.
+//                             _clearReceiveOUT(endpoint);
+//
+//                             // Clearing FIFOCon will also mark this bank as "read".
+//                             _clearFIFOControl(endpoint);
+//                             _resetEndpointBuffer(endpoint);
+//
+//                             // FOFCon will either be low now
+//                             // -OR- will be high again if there's another bank of data available.
+//                             // If it stays low, we ned to make sure we don't reset it again when we test available before returning.
+//                             // BECAUSE we don't have interrupts off, and it could, possibly, go high again before then.
+//                             // In that case, we would be flushing a full buffer.
+//                             available = -1;
+//                             continue;
+//                     }
+//
+//                     int16_t to_read = available < length ? available : length;
+//                     int16_t i = to_read;
+//
+//                     while (i--) {
+//                             *ptr_dest++ = *_endpointBuffer[endpoint]++;
+//                     }
+//                     available -= to_read;
+//                     length -= to_read;
+//                     read += to_read;
+//             }
+//
+//             // If available is negative, we don't want to flush.
+//             if (!available) {
+//                     // Flush. See notes at the top of the function.
+//                     _clearReceiveOUT(endpoint);
+//                     _clearFIFOControl(endpoint);
+//                     _resetEndpointBuffer(endpoint);
+//             }
+//
+//             return read;
+//     }
 
-		// Available = -1 means that FIFOCONtrol might not be high.
-		// It should only be >= 0 once we've proven that it is.
-		int16_t available = -1;
 
-		while (length > 0 && _isFIFOControlAvailable(endpoint)) {
-			available = _getEndpointBufferCount(endpoint);
-
-			if (!available) {
-				// We cheat and lazily clear the RXOUT interrupt.
-				// Once we might actually use that interru;t, we might need to be more proactive.
-				_clearReceiveOUT(endpoint);
-
-				// Clearing FIFOCon will also mark this bank as "read".
-				_clearFIFOControl(endpoint);
-				_resetEndpointBuffer(endpoint);
-
-				// FOFCon will either be low now
-				// -OR- will be high again if there's another bank of data available.
-				// If it stays low, we ned to make sure we don't reset it again when we test available before returning.
-				// BECAUSE we don't have interrupts off, and it could, possibly, go high again before then.
-				// In that case, we would be flushing a full buffer.
-				available = -1;
-				continue;
-			}
-
-			int16_t to_read = available < length ? available : length;
-			int16_t i = to_read;
-
-			while (i--) {
-				*ptr_dest++ = *_endpointBuffer[endpoint]++;
-			}
-			available -= to_read;
-			length -= to_read;
-			read += to_read;
-		}
-
-		// If available is negative, we don't want to flush.
-		if (!available) {
-			// Flush. See notes at the top of the function.
+	void _flushReadEndpoint(uint8_t endpoint) {
+		while(_isFIFOControlAvailable(endpoint)) {
 			_clearReceiveOUT(endpoint);
 			_clearFIFOControl(endpoint);
-			_resetEndpointBuffer(endpoint);
 		}
-
-		return read;
+		_resetEndpointBuffer(endpoint);
 	}
 
 	// Flush an endpoint after sending data.
 	void _flushEndpoint(uint8_t endpoint) {
-		_clearFIFOControl(endpoint);
+    _clearFIFOControl(endpoint);
+    _resetEndpointBuffer(endpoint);
 	}
 
 	// Send the data in a buffer to an endpoint.
@@ -412,7 +515,7 @@ namespace Motate {
 		// While we have more to send AND the buffer is available
 		while (length > 0 && _isFIFOControlAvailable(endpoint)) {
 			if (!_isReadWriteAllowed(endpoint)) {
-				_clearFIFOControl(endpoint);
+				_flushEndpoint(endpoint);
 				continue;
 			}
 
@@ -466,7 +569,6 @@ namespace Motate {
 
 			// Configure EP 0 -- there's no opportunity to have a second configuration
 			_initEndpoint(0, USBProxy.getEndpointConfig(0, /* otherSpeed = */ false));
-
 			endpointSizes[0] = USBProxy.getEndpointSize(0, /* otherSpeed = */ false);
 
 			_enableReceivedSetupInterrupt(0);
@@ -494,7 +596,6 @@ namespace Motate {
 		}
 
 		// EP 0 Interrupt
-		// FIXME! Needs to handle *any* control endpoint.
 		if ( _inAnEndpointInterrupt(0) )
 		{
 			if ( !_inAReceivedSetupInterrupt(0) )
@@ -507,7 +608,7 @@ namespace Motate {
 
 			_resetEndpointBuffer(0);
 			static Setup_t setup;
-			_readFromControlEndpoint(0, (uint8_t*)&setup, 8);
+			_readFromControlEndpoint(0, (uint8_t*)&setup, 8, /*continuation =*/false);
 			/****
 			 • the UOTGHS_DEVEPTISRx.RXSTPI bit, which is set when a new SETUP packet is received and which shall be cleared by firmware to acknowledge the packet and to **free the bank**;
 			 ****/
@@ -641,8 +742,6 @@ namespace Motate {
 					{
 						TRACE_CORE(printf(">>> EP0 Int: kSetConfiguration REQUEST_DEVICE %d\r\n", setup.wValueL);)
 
-//						UDD_InitEndpoints(EndPoints, (sizeof(EndPoints) / sizeof(EndPoints[0])));
-
 						// _configuration should be set to 1 for high-speed, and 2 for full-speed
 						_configuration = setup.valueLow();
 
@@ -691,6 +790,7 @@ namespace Motate {
 			if (ok)
 			{
 				TRACE_CORE(puts(">>> EP0 Int: Send packet\r\n");)
+                _clearReceiveOUT(0);
 				_clearTransmitIN(0);
 				_resetEndpointBuffer(0);
 			}
@@ -698,6 +798,17 @@ namespace Motate {
 			{
 				TRACE_CORE(puts(">>> EP0 Int: Stall\r\n");)
 				_requestStall(0);
+			}
+		}
+		// EP 0 Interrupt
+		// FIXME! Needs to handle *any* control endpoint.
+		else if ( _inAnEndpointInterruptNotControl() )
+		{
+			if ( _inAnOverflowInterrupt(_firstEndpointOfInterrupt()) )
+			{
+				while (1) {
+                    ;// TRAP it!
+                }
 			}
 		}
 	}

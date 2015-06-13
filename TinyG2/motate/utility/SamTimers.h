@@ -31,19 +31,38 @@
 #define SAMTIMERS_H_ONCE
 
 #include "sam.h"
+#include "SamCommon.h"
 
-/* Sam hardware timers have three channels each. Each channel is actually an
-* independent timer, so we have a little nomenclature clash.
-*
-* Sam Timer != Motate::Timer!!!
-*
-* A Sam Timer CHANNEL is actually the portion that a Motate::Timer controls
-* direcly. Each SAM CHANNEL has two Motate:Timers (A and B).
-* (Actually, the Quadrature Decoder and Block Control can mix them up some,
-* but we ignore that.)
-* So, for the Sam, we have to maintain the same interface, and treat each
-* channel as an independent timer.
-*/
+/* Sam hardware has two types of timer: "Timers" and "PWMTimers"
+ *
+ * Timers:
+ *
+ * Sam hardware timers have three channels each. Each channel is actually an
+ * independent timer, so we have a little nomenclature clash.
+ *
+ * Sam Timer != Motate::Timer!!!
+ *
+ * A Sam Timer CHANNEL is actually the portion that a Motate::Timer controls
+ * direcly. Each SAM CHANNEL has two Motate:Timers (A and B).
+ * (Actually, the Quadrature Decoder and Block Control can mix them up some,
+ * but we ignore that.)
+ * So, for the Sam, we have to maintain the same interface, and treat each
+ * channel as an independent timer.
+ *
+ *
+ * PWMTimers:
+ * 
+ * For compatibility and transparency with Timers, we use the same TimerModes,
+ * even through they actually use bitmaps for Timer registers.
+ *
+ * Timers have more modes than PWM Timers, and more interrupts.
+ * We return kInvalidMode for the ones that don't map, except that we treat "Up"
+ * and "UpToMatch" both as "LeftAligned," and "UpDown" and "UpDownToMatch"
+ * as "CenterAligned."
+ *
+ * Consequently, you can use kPWMLeftAligned and kPWMCenterAligned as valid modes
+ * on a Timer.
+ */
 
 namespace Motate {
 	enum TimerMode {
@@ -56,10 +75,14 @@ namespace Motate {
 		kTimerUp            = TC_CMR_WAVE | TC_CMR_WAVSEL_UP,
 		/* Waveform select, Up to TOP (RC) */
 		kTimerUpToMatch     = TC_CMR_WAVE | TC_CMR_WAVSEL_UP_RC,
+		/* For PWM, we'll alias kTimerUpToMatch as: */
+		kPWMLeftAligned     = TC_CMR_WAVE | TC_CMR_WAVSEL_UP_RC,
 		/* Waveform select, Up to 0xFFFFFFFF, then Down */
 		kTimerUpDown        = TC_CMR_WAVE | TC_CMR_WAVSEL_UPDOWN,
 		/* Waveform select, Up to TOP (RC), then Down */
 		kTimerUpDownToMatch = TC_CMR_WAVE | TC_CMR_WAVSEL_UPDOWN_RC,
+		/* For PWM, we'll alias kTimerUpDownToMatch as: */
+		kPWMCenterAligned     = kTimerUpDownToMatch,
 	};
 
 	/* We're trading acronyms for verbose CamelCase. Dubious. */
@@ -72,9 +95,10 @@ namespace Motate {
 		kSetAOnCompareA     = TC_CMR_ACPA_SET,
 
 		/* BCPB (TC_CMR) RB Compare Effect on TIOB */
-		kToggleBOnCompareB  = TC_CMR_BCPB_TOGGLE,
-		kClearBOnCompareB   = TC_CMR_BCPB_CLEAR,
-		kSetBOnCompareB     = TC_CMR_BCPB_SET,
+		/* See note below about TC_CMR_EEVT_XC0 */
+		kToggleBOnCompareB  = TC_CMR_BCPB_TOGGLE | TC_CMR_EEVT_XC0,
+		kClearBOnCompareB   = TC_CMR_BCPB_CLEAR | TC_CMR_EEVT_XC0,
+		kSetBOnCompareB     = TC_CMR_BCPB_SET | TC_CMR_EEVT_XC0,
 
 		/* We use "match" the same as the mode -- RC Compare */
 		/* ACPC (TC_CMR) RC Compare Effect on TIOA */
@@ -83,10 +107,23 @@ namespace Motate {
 		kSetAOnMatch        = TC_CMR_ACPC_SET,
 
 		/* BCPC (TC_CMR) RC Compare Effect on TIOB */
-		kToggleBOnMatch     = TC_CMR_BCPC_TOGGLE,
-		kClearBOnMatch      = TC_CMR_BCPC_CLEAR,
-		kSetBOnMatch        = TC_CMR_BCPC_SET,
-	};
+		kToggleBOnMatch     = TC_CMR_BCPC_TOGGLE | TC_CMR_EEVT_XC0,
+		kClearBOnMatch      = TC_CMR_BCPC_CLEAR | TC_CMR_EEVT_XC0,
+		kSetBOnMatch        = TC_CMR_BCPC_SET | TC_CMR_EEVT_XC0,
+
+
+		/* Aliases for use with PWM */
+		kPWMOnA             = kClearAOnCompareA | kSetAOnMatch,
+		kPWMOnAInverted     = kSetAOnCompareA | kClearAOnMatch,
+
+		kPWMOnB             = kClearBOnCompareB | kSetBOnMatch,
+		kPWMOnBInverted     = kSetBOnCompareB | kClearBOnMatch
+};
+
+	/* We use TC_CMR_EEVT_XC0 in the above to allow TIOB to be an output.
+	 * The defualt is for it to be the input for ExternalEvent.
+	 * By setting it to XC0, we allow it to be an output.
+	 */
 
 	enum TimerChannelInterruptOptions {
 		kInterruptsOff              = 0,
@@ -112,19 +149,28 @@ namespace Motate {
 
 	enum TimerErrorCodes {
 		kFrequencyUnattainable = -1,
+		kInvalidMode = -2,
+	};
+
+	enum PWMTimerClockOptions {
+		kPWMClockPrescalerOnly = 0,
+		kPWMClockPrescaleAndDivA = 1,
+		kPWMClockPrescaleAndDivB = 2,
 	};
 
 	typedef const uint8_t timer_number;
     
 	template <uint8_t timerNum>
-	struct Timer {
+	struct Timer : SamCommon< Timer<timerNum> > {
 
 		// NOTE: Notice! The *pointers* are const, not the *values*.
 		static Tc * const tc();
 		static TcChannel * const tcChan();
 		static const uint32_t peripheralId(); // ID_TC0 .. ID_TC8
 		static const IRQn_Type tcIRQ();
-
+        
+        typedef SamCommon< Timer<timerNum> > common;
+        
 		/********************************************************************
 		**                          WARNING                                **
 		** WARNING: Sam channels (tcChan) DO NOT map to Motate Channels!?! **
@@ -151,34 +197,6 @@ namespace Motate {
 			tc()->TC_WPMR = TC_WPMR_WPEN | TC_WPMR_WPKEY(0x54494D);
 		}
 
-		void enablePeripheralClock() {
-			if (peripheralId() < 32) {
-				uint32_t id_mask = 1u << ( peripheralId() );
-				if ((PMC->PMC_PCSR0 & id_mask) != id_mask) {
-					PMC->PMC_PCER0 = id_mask;
-				}
-			} else {
-				uint32_t id_mask = 1u << ( peripheralId() - 32 );
-				if ((PMC->PMC_PCSR1 & id_mask) != id_mask) {
-					PMC->PMC_PCER1 = id_mask;
-				}
-			}
-		};
-
-		void disablePeripheralClock() {
-			if (peripheralId() < 32) {
-				uint32_t id_mask = 1u << ( peripheralId() );
-				if ((PMC->PMC_PCSR0 & id_mask) == id_mask) {
-					PMC->PMC_PCDR0 = id_mask;
-				}
-			} else {
-				uint32_t id_mask = 1u << ( peripheralId() - 32 );
-				if ((PMC->PMC_PCSR1 & id_mask) == id_mask) {
-					PMC->PMC_PCDR1 = id_mask;
-				}
-			}
-		};
-
 		// Set the mode and frequency.
 		// Returns: The actual frequency that was used, or kFrequencyUnattainable
 		// freq is not const since we may "change" it
@@ -189,12 +207,12 @@ namespace Motate {
 			/*   Disable interrupts */
 			tcChan()->TC_IDR = 0xFFFFFFFF ;
 			/*   Clear status register */
-			tcChan()->TC_SR ;
+			tcChan()->TC_SR;
 
-			enablePeripheralClock();
+            common::enablePeripheralClock();
 
 			if (mode == kTimerUpDownToMatch || mode == kTimerUpDown)
-				freq *= 2;
+				freq /= 2;
 
 			/* Setup clock "prescaler" */
 			/* Divisors: TC1: 2, TC2: 8, TC3: 32, TC4: 128, TC5: ???! */
@@ -209,32 +227,37 @@ namespace Motate {
 			// TC1 = MCK/2
 			if (freq > ((masterClock / 2) / 0x10000) && freq < (masterClock / 2)) {
 				/*  Set mode */
-				tcChan()->TC_CMR = mode | TC_CMR_TCCLKS_TIMER_CLOCK1;
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_WAVSEL_Msk | TC_CMR_TCCLKS_Msk)) |
+					mode | TC_CMR_TCCLKS_TIMER_CLOCK1;
 				divisor = 2;
 
 			// TC2 = MCK/8
 			} else if (freq > ((masterClock / 8) / 0x10000) && freq < (masterClock / 8)) {
 						/*  Set mode */
-				tcChan()->TC_CMR = mode | TC_CMR_TCCLKS_TIMER_CLOCK2;
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_WAVSEL_Msk | TC_CMR_TCCLKS_Msk)) |
+					mode | TC_CMR_TCCLKS_TIMER_CLOCK2;
 				divisor = 8;
 
 			// TC3 = MCK/32
 			} else if (freq > ((masterClock / 32) / 0x10000) && freq < (masterClock / 32)) {
 						/*  Set mode */
-				tcChan()->TC_CMR = mode | TC_CMR_TCCLKS_TIMER_CLOCK3;
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_WAVSEL_Msk | TC_CMR_TCCLKS_Msk)) |
+					mode | TC_CMR_TCCLKS_TIMER_CLOCK3;
 				divisor = 32;
 
 			// TC4 = MCK/128
 			} else if (freq > ((masterClock / 128) / 0x10000) && freq < (masterClock / 128)) {
 						/*  Set mode */
-				tcChan()->TC_CMR = mode | TC_CMR_TCCLKS_TIMER_CLOCK4;
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_WAVSEL_Msk | TC_CMR_TCCLKS_Msk)) |
+					mode | TC_CMR_TCCLKS_TIMER_CLOCK4;
 				divisor = 128;
 
 			// Nothing fit! Hmm...
 			} else {
 				// PUNT! For now, just guess TC1.
 				/*  Set mode */
-				tcChan()->TC_CMR = mode | TC_CMR_TCCLKS_TIMER_CLOCK1;
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_WAVSEL_Msk | TC_CMR_TCCLKS_Msk)) |
+					mode | TC_CMR_TCCLKS_TIMER_CLOCK1;
 
 				return kFrequencyUnattainable;
 			}
@@ -299,11 +322,11 @@ namespace Motate {
 
 		// Specify the duty cycle as a value from 0.0 .. 1.0;
 		void setDutyCycleA(const float ratio) {
-			tcChan()->TC_RA = getTopValue() * ratio;
+			setExactDutyCycleA(getTopValue() * ratio);
 		};
 
 		void setDutyCycleB(const float ratio) {
-				tcChan()->TC_RB = getTopValue() * ratio;
+			setExactDutyCycleB(getTopValue() * ratio);
 		};
 
 		// Specify channel A/B duty cycle as a integer value from 0 .. TOP.
@@ -324,17 +347,78 @@ namespace Motate {
 													 TC_CMR_ACPA_Msk |
 													 TC_CMR_BCPB_Msk |
 													 TC_CMR_ACPC_Msk |
-													 TC_CMR_BCPC_Msk
+													 TC_CMR_BCPC_Msk |
+													 TC_CMR_EEVT_XC0
 													)
 								) | options;
 		};
 
+		// Use this to leave the OutputB options alone.
+		void setOutputAOptions(const uint32_t options) {
+
+			// Note that we carefully crafted the TimerChannelOutputOptions
+			// to match the bits in CMR, so we just mask and set!
+			tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(
+													 TC_CMR_ACPA_Msk |
+													 TC_CMR_ACPC_Msk
+													 )
+								) | options;
+		};
+		// Use this to leave the OutputA options alone.
+		void setOutputBOptions(const uint32_t options) {
+			// Note that we carefully crafted the TimerChannelOutputOptions
+			// to match the bits in CMR, so we just mask and set!
+			tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(
+													 TC_CMR_BCPB_Msk |
+													 TC_CMR_BCPC_Msk |
+													 TC_CMR_EEVT_XC0
+													 )
+								) | options;
+		};
+
+		// These are special function for stopping output waveforms.
+		// This is defferent from stopping the timer, which kill both channels and
+		// all interrupts. This simply stops the pin output from changing, and is used
+		// to set the duty cycle to 0.
+
+		// ASSUMPTION: The pin is not in Toggle mode.
+		void stopPWMOutputA() {
+			if ((tcChan()->TC_CMR & TC_CMR_ACPA_Msk) == kSetAOnCompareA)
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_ACPC_Msk)) | kSetAOnMatch;
+			else
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_ACPC_Msk)) | kClearAOnMatch;
+		};
+
+		void stopPWMOutputB() {
+			if ((tcChan()->TC_CMR & TC_CMR_BCPB_Msk) == kSetBOnCompareB)
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_BCPC_Msk)) | kSetBOnMatch;
+			else
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_BCPC_Msk)) | kClearBOnMatch;
+		};
+
+		// These two start the waveform. We try to be as fast as we can.
+		// ASSUMPTION: We stopped it with the corresponding function.
+		// ASSUMPTION: The pin is not and was not in Toggle mode.
+		void startPWMOutputA() {
+			if ((tcChan()->TC_CMR & TC_CMR_ACPA_Msk) == kSetAOnCompareA)
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_ACPC_Msk)) | kClearAOnMatch;
+			else
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_ACPC_Msk)) | kSetAOnMatch;
+		};
+
+		void startPWMOutputB() {
+			if ((tcChan()->TC_CMR & TC_CMR_BCPB_Msk) == kSetBOnCompareB)
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_BCPC_Msk)) | kClearBOnMatch;
+			else
+				tcChan()->TC_CMR = (tcChan()->TC_CMR & ~(TC_CMR_BCPC_Msk)) | kSetBOnMatch;
+		};
+
+
 		void setInterrupts(const uint32_t interrupts) {
 			if (interrupts != kInterruptsOff) {
 				tcChan()->TC_IDR = 0xFFFFFFFF;
-				NVIC_EnableIRQ(tcIRQ());
 
-				if (interrupts | kInterruptOnOverflow) {
+				if (interrupts & kInterruptOnOverflow) {
 					// Check to see if we're overflowing on C. See getTopValue() description.
 					if (tcChan()->TC_CMR & TC_CMR_CPCTRG) {
 						tcChan()->TC_IER = TC_IER_CPCS; // RC Compare
@@ -342,30 +426,31 @@ namespace Motate {
 						tcChan()->TC_IER = TC_IER_COVFS; // Counter Overflow
 					}
 				}
-				if (interrupts | kInterruptOnMatchA) {
+				if (interrupts & kInterruptOnMatchA) {
 					tcChan()->TC_IER = TC_IER_CPAS; // RA Compare
 				}
-				if (interrupts | kInterruptOnMatchB) {
+				if (interrupts & kInterruptOnMatchB) {
 					tcChan()->TC_IER = TC_IER_CPBS; // RB Compare
 				}
 
 				/* Set interrupt priority */
-				if (interrupts | kInterruptPriorityHighest) {
+				if (interrupts & kInterruptPriorityHighest) {
 					NVIC_SetPriority(tcIRQ(), 0);
 				}
-				else if (interrupts | kInterruptPriorityHigh) {
+				else if (interrupts & kInterruptPriorityHigh) {
 					NVIC_SetPriority(tcIRQ(), 3);
 				}
-				else if (interrupts | kInterruptPriorityMedium) {
+				else if (interrupts & kInterruptPriorityMedium) {
 					NVIC_SetPriority(tcIRQ(), 7);
 				}
-				else if (interrupts | kInterruptPriorityLow) {
+				else if (interrupts & kInterruptPriorityLow) {
 					NVIC_SetPriority(tcIRQ(), 11);
 				}
-				else if (interrupts | kInterruptPriorityLowest) {
+				else if (interrupts & kInterruptPriorityLowest) {
 					NVIC_SetPriority(tcIRQ(), 15);
 				}
 
+				NVIC_EnableIRQ(tcIRQ());
 			} else {
 				tcChan()->TC_IDR = 0xFFFFFFFF;
 				NVIC_DisableIRQ(tcIRQ());
@@ -408,6 +493,321 @@ namespace Motate {
 			return kInterruptUnknown;
 		}
 
+		// Placeholder for user code.
+		static void interrupt() __attribute__ ((weak));
+	};
+
+
+	template <uint8_t timerNum>
+	struct PWMTimer {
+
+		// NOTE: Notice! The *pointers* are const, not the *values*.
+		static Pwm * const pwm();
+		static PwmCh_num * const pwmChan();
+		static const uint32_t peripheralId(); // ID_TC0 .. ID_TC8
+		static const IRQn_Type pwmIRQ();
+
+		/********************************************************************
+		 **                          WARNING                                **
+		 ** WARNING: Sam channels (tcChan) DO NOT map to Motate Channels!?! **
+		 **                          WARNING           (u been warned)      **
+		 *********************************************************************/
+
+		PWMTimer() { init(); };
+		PWMTimer(const TimerMode mode, const uint32_t freq) {
+			init();
+			setModeAndFrequency(mode, freq);
+		};
+
+		void init() {
+			/* Unlock this thing */
+			unlock();
+		}
+
+#ifndef YOU_REALLY_WANT_PWM_LOCK_AND_UNLOCK
+#define YOU_REALLY_WANT_PWM_LOCK_AND_UNLOCK 0
+#endif
+
+#if YOU_REALLY_WANT_PWM_LOCK_AND_UNLOCK
+		// You probably don't....
+		void unlock() {
+			pwm()->PWM_WPCR = PWM_WPCR_WPKEY(0x50574D /* "PWM" */);
+		}
+
+		/* WHOA!! Only do this if you know what you're doing!! */
+		void lock() {
+			// This locks EVERYTHING!!!
+			pwm()->PWM_WPCR = PWM_WPCR_WPCMD(1) | PWM_WPCR_WPRG0 | PWM_WPCR_WPRG1 | PWM_WPCR_WPRG2 | PWM_WPCR_WPRG3 | PWM_WPCR_WPRG4 | PWM_WPCR_WPRG5 | TC_WPMR_WPKEY(0x54494D);
+		}
+#else
+		// Non-ops to keep the compiler happy.
+		void unlock() {};
+		void lock() {};
+#endif
+
+		void enablePeripheralClock() {
+			if (peripheralId() < 32) {
+				uint32_t id_mask = 1u << ( peripheralId() );
+				if ((PMC->PMC_PCSR0 & id_mask) != id_mask) {
+					PMC->PMC_PCER0 = id_mask;
+				}
+			} else {
+				uint32_t id_mask = 1u << ( peripheralId() - 32 );
+				if ((PMC->PMC_PCSR1 & id_mask) != id_mask) {
+					PMC->PMC_PCER1 = id_mask;
+				}
+			}
+		};
+
+		void disablePeripheralClock() {
+			if (peripheralId() < 32) {
+				uint32_t id_mask = 1u << ( peripheralId() );
+				if ((PMC->PMC_PCSR0 & id_mask) == id_mask) {
+					PMC->PMC_PCDR0 = id_mask;
+				}
+			} else {
+				uint32_t id_mask = 1u << ( peripheralId() - 32 );
+				if ((PMC->PMC_PCSR1 & id_mask) == id_mask) {
+					PMC->PMC_PCDR1 = id_mask;
+				}
+			}
+		};
+
+		/* Set the mode and frequency.
+		 * Returns: The actual frequency that was used, or kFrequencyUnattainable
+		 * freq is not const since we may "change" it.
+		 * PWM module can optionally use one of two additional prescale multipliers:
+		 *     A (kPWMClockPrescaleAndDivA) or B (kPWMClockPrescaleAndDivB).
+		 * However, these are shared clocks used by all PWM channels.
+		 * Only use these on timers that will have drastically different periods.
+		 * There is currently no way to set multiple times to the same Clock A or B.
+		 */
+		int32_t setModeAndFrequency(const TimerMode mode, uint32_t frequency, const uint8_t clock = kPWMClockPrescalerOnly) {
+			/* Prepare to be able to make changes: */
+			/*   Disable TC clock */
+			pwm()->PWM_DIS = 1 << timerNum ;
+			/*   Disable interrupts */
+			pwm()->PWM_IDR1 = 0xFFFFFFFF ;
+			pwm()->PWM_IDR2	= 0xFFFFFFFF ;
+
+			enablePeripheralClock();
+
+			if (mode == kTimerInputCapture || mode == kTimerInputCaptureToMatch)
+				return kFrequencyUnattainable;
+
+			// Remember: kTimerUpDownToMatch and kPWMCenterAligned are identical.
+			if (mode == kPWMCenterAligned)
+				frequency /= 2;
+
+			/* Setup clock "prescaler" */
+			/* Divisors: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024 */
+
+			// Grab the SystemCoreClock value, in case it's volatile.
+			uint32_t masterClock = SystemCoreClock;
+
+			// Store the divisor temporarily, to avoid looking it up again...
+			uint32_t divisors[11] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024};
+			uint8_t divisor_index = 0;
+			uint32_t prescaler;
+
+			if (clock == kPWMClockPrescaleAndDivA || clock == kPWMClockPrescaleAndDivB) {
+				// ** THIS CLOCK A/CLOCK B CODE ALL NEEDS CHECKED ** //
+
+
+				// Find prescaler value
+				prescaler = (masterClock / divisors[divisor_index]) / frequency;
+				while ((prescaler > 255) && (divisor_index < 11)) {
+					divisor_index++;
+					prescaler = (masterClock / divisors[divisor_index]) / frequency;
+				}
+
+				
+				// Set the actual frequency, if we found a match.
+				if (clock == kPWMClockPrescaleAndDivA) {
+					// Setup divisor A
+
+					PWM->PWM_CLK = (PWM->PWM_CLK & ~PWM_CLK_DIVA_Msk) | prescaler | (divisors[divisor_index] << 8);
+
+					int32_t newTop = masterClock/(divisors[divisor_index] * prescaler * frequency);
+					setTop(newTop, /*setOnNext=*/false);
+
+					// Determine and return the new frequency.
+					return masterClock/(divisors[divisor_index]*newTop);
+				}
+				else { // if clock == kPWMClockPrescaleAndDivB
+					   // SAME THING, BUT B
+				}
+			}
+
+			// if clock == kPWMClockPrescalerOnly
+
+			// Find prescaler value
+			uint32_t test_value = masterClock / divisors[divisor_index];
+
+			// We assume if (divisor_index == 10) then 10 will be the value we use...
+			// We want OUT of the while loop when we have the right divisor.
+			// AGAIN: FAILING this test means we have the RIGHT divisor.
+			while ((divisor_index < 10) && ((frequency > test_value) || (frequency < (test_value / 0x10000)))) {
+				divisor_index++;
+				test_value = masterClock / divisors[divisor_index];
+			}
+
+			pwmChan()->PWM_CMR = (divisor_index & 0xff) | (mode == kPWMCenterAligned ? PWM_CMR_CALG : 0) |
+              /* Preserve inversion: */(pwmChan()->PWM_CMR & PWM_CMR_CPOL);
+
+			// ToDo: Polarity setttings, Dead-Time control, Counter events
+
+			int32_t newTop = test_value / frequency;
+			setTop(newTop, /*setOnNext=*/ false);
+
+			// Determine and return the new frequency.
+			return test_value * newTop;
+		};
+
+		// Set the TOP value for modes that use it.
+		// WARNING: No sanity checking is done to verify that you are, indeed, in a mode that uses it.
+		void setTop(const uint32_t topValue, bool setOnNext = true) {
+			if (setOnNext)
+				pwmChan()->PWM_CPRDUPD = topValue;
+			else
+				pwmChan()->PWM_CPRD = topValue;
+		};
+
+		// Here we want to get what the TOP value is.
+		uint32_t getTopValue() {
+			return pwmChan()->PWM_CPRD;
+		};
+
+		// Return the current value of the counter. This is a fleeting thing...
+		uint32_t getValue() {
+			return pwmChan()->PWM_CCNT;
+		}
+
+		void start() {
+			pwm()->PWM_ENA = 1 << timerNum;
+		};
+
+		void stop() {
+			pwm()->PWM_DIS = 1 << timerNum;
+		};
+
+		// Channel-specific functions. These are Motate channels, but they happen to line-up.
+
+		// Specify the duty cycle as a value from 0.0 .. 1.0;
+		void setDutyCycleA(const float ratio, bool setOnNext = true) {
+			if (setOnNext)
+				pwmChan()->PWM_CDTYUPD = getTopValue() * ratio;
+			else
+				pwmChan()->PWM_CDTY = getTopValue() * ratio;
+
+		};
+
+		// Specify channel A/B duty cycle as a integer value from 0 .. TOP.
+		// TOP in this case is either RC_RC or 0xFFFF.
+		void setExactDutyCycleA(const uint32_t absolute, bool setOnNext = true) {
+			if (setOnNext)
+				pwmChan()->PWM_CDTYUPD = absolute;
+			else
+				pwmChan()->PWM_CDTY = absolute;
+
+		};
+
+		void setOutputOptions(const uint32_t options) {
+			setOutputAOptions(options);
+		};
+
+		void setOutputAOptions(const uint32_t options) {
+			if (options == kPWMOnAInverted) {
+				pwmChan()->PWM_CMR |= PWM_CMR_CPOL;
+			}
+			else if (options == kPWMOnA) {
+				pwmChan()->PWM_CMR &= ~PWM_CMR_CPOL;
+			}
+		};
+
+
+		// ASSUMPTION: The pin is not in Toggle mode.
+		void stopPWMOutputA() {
+//			stop();
+		};
+
+		// These two start the waveform. We try to be as fast as we can.
+		// ASSUMPTION: We stopped it with the corresponding function.
+		// ASSUMPTION: The pin is not and was not in Toggle mode.
+		void startPWMOutputA() {
+//			start();
+		};
+
+		void setInterrupts(const uint32_t interrupts) {
+#if 0
+			// TODO
+			if (interrupts != kInterruptsOff) {
+				pwmChan()->TC_IDR = 0xFFFFFFFF;
+				NVIC_EnableIRQ(pwmIRQ());
+
+				if (interrupts & kInterruptOnOverflow) {
+					// Check to see if we're overflowing on C. See getTopValue() description.
+					if (pwmChan()->TC_CMR & TC_CMR_CPCTRG) {
+						pwmChan()->TC_IER = TC_IER_CPCS; // RC Compare
+					} else {
+						pwmChan()->TC_IER = TC_IER_COVFS; // Counter Overflow
+					}
+				}
+				if (interrupts & kInterruptOnMatchA) {
+					pwmChan()->TC_IER = TC_IER_CPAS; // RA Compare
+				}
+				if (interrupts & kInterruptOnMatchB) {
+					pwmChan()->TC_IER = TC_IER_CPBS; // RB Compare
+				}
+
+				/* Set interrupt priority */
+				if (interrupts & kInterruptPriorityHighest) {
+					NVIC_SetPriority(pwmIRQ(), 0);
+				}
+				else if (interrupts & kInterruptPriorityHigh) {
+					NVIC_SetPriority(pwmIRQ(), 3);
+				}
+				else if (interrupts & kInterruptPriorityMedium) {
+					NVIC_SetPriority(pwmIRQ(), 7);
+				}
+				else if (interrupts & kInterruptPriorityLow) {
+					NVIC_SetPriority(pwmIRQ(), 11);
+				}
+				else if (interrupts & kInterruptPriorityLowest) {
+					NVIC_SetPriority(pwmIRQ(), 15);
+				}
+
+			} else {
+				pwmChan()->TC_IDR = 0xFFFFFFFF;
+				NVIC_DisableIRQ(pwmIRQ());
+			}
+#endif
+		}
+
+		void setInterruptPending() {
+			NVIC_SetPendingIRQ(pwmIRQ());
+		}
+
+		TimerChannelInterruptOptions getInterruptCause() {
+#if 0
+			uint32_t sr = pwmChan()->TC_SR;
+			// if it is either an overflow or a RC compare
+			if (sr & (TC_SR_COVFS | TC_SR_CPCS)) {
+				return kInterruptOnOverflow;
+			}
+			else if (sr & (TC_SR_CPAS)) {
+				return kInterruptOnMatchA;
+			}
+			else if (sr & (TC_SR_CPBS)) {
+				return kInterruptOnMatchB;
+			}
+			else if (sr & (TC_SR_ETRGS)) {
+				return kInterruptOnMatchA;
+			}
+#endif
+			return kInterruptUnknown;
+		}
+		
 		// Placeholder for user code.
 		static void interrupt() __attribute__ ((weak));
 	};
@@ -464,7 +864,7 @@ namespace Motate {
 		uint32_t doneTime = SysTickTimer.getValue() + microseconds;
 
 		do
-		{} while ( doneTime < SysTickTimer.getValue() );
+		{} while ( SysTickTimer.getValue() < doneTime );
 	}
 
 } // namespace Motate

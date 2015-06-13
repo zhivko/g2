@@ -2,7 +2,7 @@
  * util.cpp - a random assortment of useful functions
  * This file is part of the TinyG project
  *
- * Copyright (c) 2010 - 2013 Alden S. Hart, Jr.
+ * Copyright (c) 2010 - 2014 Alden S. Hart, Jr.
  *
  * This file ("the software") is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2 as published by the
@@ -24,22 +24,43 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
  * OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-/* util contains a dog's breakfast of supporting functions that are not specific to tinyg: 
+/* util contains a dog's breakfast of supporting functions that are not specific to tinyg:
  * including:
- *	  - math and min/max utilities and extensions 
+ *	  - math and min/max utilities and extensions
  *	  - vector manipulation utilities
  */
 
 #include "tinyg2.h"
 #include "util.h"
 
-#ifdef __cplusplus
-extern "C"{
+#ifdef __AVR
+#include "xmega/xmega_rtc.h"
 #endif
+
+
+//*** debug utilities ***
+
+#ifdef IN_DEBUGGER
+#pragma GCC push_options
+#pragma GCC optimize ("O0")
+void _debug_trap() {
+    while (1) {
+        __NOP();
+    }
+}
+#pragma GCC reset_options
+#else
+void _debug_trap() {
+    // We might be able to put a print here, but it MIGHT interrupt other output
+    // and might be deep in an ISR, so we had better just _NOP() and hope for the best.
+    __NOP();
+}
+#endif
+
 
 /**** Vector utilities ****
  * copy_vector()			- copy vector of arbitrary length
- * copy_axis_vector()		- copy an axis vector
+ * vector_equal()			- test if vectors are equal
  * get_axis_vector_length()	- return the length of an axis vector
  * set_vector()				- load values into vector form
  * set_vector_by_axis()		- load a single value into a zero vector
@@ -48,16 +69,11 @@ extern "C"{
 float vector[AXES];	// statically allocated global for vector utilities
 
 /*
-void copy_vector(float dst[], const float src[], uint8_t length)
+void copy_vector(float dst[], const float src[])
 {
-	for (uint8_t i=0; i<length; i++) { dst[i] = src[i]; }
+	memcpy(dst, src, sizeof(dst));
 }
 */
-
-void copy_axis_vector(float dst[], const float src[])
-{
-	memcpy(dst, src, sizeof(float)*AXES);
-}
 
 uint8_t vector_equal(const float a[], const float b[])
 {
@@ -72,7 +88,7 @@ uint8_t vector_equal(const float a[], const float b[])
 	return (false);
 }
 
-float get_axis_vector_length(const float a[], const float b[]) 
+float get_axis_vector_length(const float a[], const float b[])
 {
 	return (sqrt(square(a[AXIS_X] - b[AXIS_X]) +
 				 square(a[AXIS_Y] - b[AXIS_Y]) +
@@ -127,16 +143,16 @@ float *set_vector_by_axis(float value, uint8_t axis)
 float min3(float x1, float x2, float x3)
 {
 	float min = x1;
-	if (x2 < min) { min = x2;} 
-	if (x3 < min) { return (x3);} 
+	if (x2 < min) { min = x2;}
+	if (x3 < min) { return (x3);}
 	return (min);
 }
 
 float min4(float x1, float x2, float x3, float x4)
 {
 	float min = x1;
-	if (x2 < min) { min = x2;} 
-	if (x3 < min) { min = x3;} 
+	if (x2 < min) { min = x2;}
+	if (x3 < min) { min = x3;}
 	if (x4 < min) { return (x4);}
 	return (min);
 }
@@ -144,16 +160,16 @@ float min4(float x1, float x2, float x3, float x4)
 float max3(float x1, float x2, float x3)
 {
 	float max = x1;
-	if (x2 > max) { max = x2;} 
-	if (x3 > max) { return (x3);} 
+	if (x2 > max) { max = x2;}
+	if (x3 > max) { return (x3);}
 	return (max);
 }
 
 float max4(float x1, float x2, float x3, float x4)
 {
 	float max = x1;
-	if (x2 > max) { max = x2;} 
-	if (x3 > max) { max = x3;} 
+	if (x2 > max) { max = x2;}
+	if (x3 > max) { max = x3;}
 	if (x4 > max) { return (x4);}
 	return (max);
 }
@@ -169,13 +185,13 @@ uint8_t * strcpy_U( uint8_t * dst, const uint8_t * src )
 {
 	uint16_t index = 0;
 	do {
-		dst[index] = src[index];	
+		dst[index] = src[index];
 	} while (src[index++] != 0);
 	return dst;
 }
 */
 
-uint8_t isnumber(char_t c)
+uint8_t isnumber(char c)
 {
 	if (c == '.') { return (true); }
 	if (c == '-') { return (true); }
@@ -183,10 +199,10 @@ uint8_t isnumber(char_t c)
 	return (isdigit(c));
 }
 
-char_t *escape_string(char_t *dst, char_t *src) 
+char *escape_string(char *dst, char *src)
 {
-	char_t c;
-	char_t *start_dst = dst;
+	char c;
+	char *start_dst = dst;
 
 	while ((c = *(src++)) != 0) {	// NUL
 		if (c == '"') { *(dst++) = '\\'; }
@@ -195,24 +211,82 @@ char_t *escape_string(char_t *dst, char_t *src)
 	return (start_dst);
 }
 
-/* 
+/*
+ * pstr2str() - return an AVR style progmem string as a RAM string. No effect on ARMs
+ *
+ *	This function deals with FLASH memory string confusion between the AVR series and ARMs.
+ *	AVRs typically have xxxxx_P() functions which take strings from FLASH as args.
+ *	On ARMs there is no need for this as strings are handled identically in FLASH and RAM.
+ *
+ *	This function copies a string from FLASH to a pre-allocated RAM buffer - see main.c for
+ *	allocation and max length. On the ARM it's a pass through that just returns the address
+ *	of the input string
+ */
+const char *pstr2str(const char *pgm_string)
+{
+#ifdef __AVR
+	strncpy_P(global_string_buf, pgm_string, MESSAGE_LEN);
+	return (global_string_buf);
+#endif
+#ifdef __ARM
+//	return ((char_t *)pgm_string);
+	return (pgm_string);
+#endif
+}
+
+/*
+ * fntoa() - return ASCII string given a float and a decimal precision value
+ *
+ *	Like sprintf, fntoa returns length of string, less the terminating NUL character
+ */
+char fntoa(char *str, float n, uint8_t precision)
+{
+    // handle special cases
+	if (isnan(n)) {
+		strcpy(str, "nan");
+		return (3);
+
+	} else if (isinf(n)) {
+		strcpy(str, "inf");
+		return (3);
+/*
+	} else if (precision == 0 ) { return((char_t)sprintf((char *)str, "%0.0f", (double) n));
+	} else if (precision == 1 ) { return((char_t)sprintf((char *)str, "%0.1f", (double) n));
+	} else if (precision == 2 ) { return((char_t)sprintf((char *)str, "%0.2f", (double) n));
+	} else if (precision == 3 ) { return((char_t)sprintf((char *)str, "%0.3f", (double) n));
+	} else if (precision == 4 ) { return((char_t)sprintf((char *)str, "%0.4f", (double) n));
+	} else if (precision == 5 ) { return((char_t)sprintf((char *)str, "%0.5f", (double) n));
+	} else if (precision == 6 ) { return((char_t)sprintf((char *)str, "%0.6f", (double) n));
+	} else if (precision == 7 ) { return((char_t)sprintf((char *)str, "%0.7f", (double) n));
+	} else					    { return((char_t)sprintf((char *)str, "%f", (double) n)); }
+
+*/
+	} else if (precision == 0 ) { return(sprintf(str, "%0.0f", (double) n));
+	} else if (precision == 1 ) { return(sprintf(str, "%0.1f", (double) n));
+	} else if (precision == 2 ) { return(sprintf(str, "%0.2f", (double) n));
+	} else if (precision == 3 ) { return(sprintf(str, "%0.3f", (double) n));
+	} else if (precision == 4 ) { return(sprintf(str, "%0.4f", (double) n));
+	} else if (precision == 5 ) { return(sprintf(str, "%0.5f", (double) n));
+	} else if (precision == 6 ) { return(sprintf(str, "%0.6f", (double) n));
+	} else if (precision == 7 ) { return(sprintf(str, "%0.7f", (double) n));
+	} else					    { return(sprintf(str, "%f", (double) n)); }
+}
+
+/*
  * compute_checksum() - calculate the checksum for a string
- * 
+ *
  *	Stops calculation on null termination or length value if non-zero.
  *
- * 	This is based on the the Java hashCode function. 
+ * 	This is based on the the Java hashCode function.
  *	See http://en.wikipedia.org/wiki/Java_hashCode()
  */
 #define HASHMASK 9999
 
-uint16_t compute_checksum(char_t const *string, const uint16_t length) 
+uint16_t compute_checksum(char const *string, const uint16_t length)
 {
 	uint32_t h = 0;
 	uint16_t len = strlen(string);
-
-	if (length != 0) {
-		len = min(len, length);
-	}
+	if (length != 0) len = min(len, length);
     for (uint16_t i=0; i<len; i++) {
 		h = 31 * h + string[i];
     }
@@ -222,13 +296,17 @@ uint16_t compute_checksum(char_t const *string, const uint16_t length)
 /*
  * SysTickTimer_getValue() - this is a hack to get around some compatibility problems
  */
+
+#ifdef __AVR
+uint32_t SysTickTimer_getValue()
+{
+	return (rtc.sys_ticks);
+}
+#endif // __AVR
+
 #ifdef __ARM
 uint32_t SysTickTimer_getValue()
 {
 	return (SysTickTimer.getValue());
 }
-#endif
-
-#ifdef __cplusplus
-}
-#endif
+#endif // __ARM

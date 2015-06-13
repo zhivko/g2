@@ -2,7 +2,7 @@
  * help.cpp - collected help routines
  * This file is part of the TinyG2 project
  *
- * Copyright (c) 2010 - 2013 Alden S. Hart, Jr.
+ * Copyright (c) 2010 - 2015 Alden S. Hart, Jr.
  *
  * This file ("the software") is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2 as published by the
@@ -22,15 +22,11 @@
 #include "report.h"
 #include "help.h"
 
-#ifdef __cplusplus
-extern "C"{
-#endif
-
 // help helper functions (snicker)
 
-stat_t help_stub(cmdObj_t *cmd) {return (STAT_OK);}
+stat_t help_stub(nvObj_t *nv) {return (STAT_OK);}
 
-#ifdef __HELP_SCREENS
+#if defined(__TEXT_MODE) && defined(__HELP_SCREENS)
 
 static void _status_report_advisory()
 {
@@ -44,18 +40,18 @@ See the wiki below for more details.\n\
 static void _postscript()
 {
 fprintf_P(stderr, PSTR("\n\
-For detailed TinyG info see: https://github.com/synthetos/TinyG/wiki/\n\
+For detailed TinyG info see: https://github.com/synthetos/TinyG/wiki\n\
 For the latest firmware see: https://github.com/synthetos/TinyG\n\
-Please log any issues at http://www.synthetos.com/forums\n\
+Please log any issues at https://github.com/synthetos/TinyG/issues\n\
 Have fun\n"));
-} 
+}
 
 /*
  * help_general() - help invoked as h from the command line
  */
-uint8_t help_general(cmdObj_t *cmd)
+uint8_t help_general(nvObj_t *nv)
 {
-fprintf_P(stderr, PSTR("\n\n\n#### TinyG Help ####\n"));
+fprintf_P(stderr, PSTR("\n\n\n### TinyG Help ###\n"));
 fprintf_P(stderr, PSTR("\
 These commands are active from the command line:\n\
  ^x             Reset (control x) - software reset\n\
@@ -79,9 +75,9 @@ return(STAT_OK);
 /*
  * help_config() - help invoked as $h
  */
-stat_t help_config(cmdObj_t *cmd)
+stat_t help_config(nvObj_t *nv)
 {
-fprintf_P(stderr, PSTR("\n\n\n#### TinyG CONFIGURATION Help ####\n"));
+fprintf_P(stderr, PSTR("\n\n\n### TinyG CONFIGURATION Help ###\n"));
 fprintf_P(stderr, PSTR("\
 These commands are active for configuration:\n\
   $sys Show system (general) settings\n\
@@ -112,9 +108,9 @@ return(STAT_OK);
 /*
  * help_test() - help invoked for tests
  */
-stat_t help_test(cmdObj_t *cmd)
+stat_t help_test(nvObj_t *nv)
 {
-fprintf_P(stderr, PSTR("\n\n\n#### TinyG SELF TEST Help ####\n"));
+fprintf_P(stderr, PSTR("\n\n\n### TinyG SELF TEST Help ###\n"));
 fprintf_P(stderr, PSTR("\
 Invoke self test by entering $test=N where N is one of:\n\
   $test=1  smoke test\n\
@@ -143,9 +139,9 @@ return(STAT_OK);
 /*
  * help_defa() - help invoked for defaults
  */
-stat_t help_defa(cmdObj_t *cmd)
+stat_t help_defa(nvObj_t *nv)
 {
-fprintf_P(stderr, PSTR("\n\n\n#### TinyG RESTORE DEFAULTS Help ####\n"));
+fprintf_P(stderr, PSTR("\n\n\n### TinyG RESTORE DEFAULTS Help ###\n"));
 fprintf_P(stderr, PSTR("\
 Enter $defa=1 to reset the system to the factory default values.\n\
 This will overwrite any changes you have made.\n"));
@@ -154,19 +150,15 @@ return(STAT_OK);
 }
 
 /*
- * help_boot_loader()
+ * help_flash()
  */
-stat_t help_boot_loader(cmdObj_t *cmd)
+stat_t help_flash(nvObj_t *nv)
 {
-fprintf_P(stderr, PSTR("\n\n\n#### TinyG BOOT LOADER Help ####\n"));
+fprintf_P(stderr, PSTR("\n\n\n### TinyG FLASH LOADER Help ###\n"));
 fprintf_P(stderr, PSTR("\
-Enter $boot=1 to enter the boot loader.\n"));
+Enter $flash=1 to enter the flash loader.\n"));
 _postscript();
 return(STAT_OK);
 }
 
-#endif // __HELP_SCREENS
-
-#ifdef __cplusplus
-}
-#endif
+#endif // defined(__TEXT_MODE) && defined(__HELP_SCREENS)

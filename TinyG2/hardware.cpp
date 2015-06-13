@@ -2,7 +2,7 @@
  * hardware.cpp - general hardware support functions
  * This file is part of the TinyG project
  *
- * Copyright (c) 2010 - 2012 Alden S. Hart, Jr.
+ * Copyright (c) 2010 - 2015 Alden S. Hart, Jr.
  *
  * This file ("the software") is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2 as published by the
@@ -32,12 +32,15 @@
 #include "tinyg2.h"		// #1
 #include "config.h"		// #2
 #include "hardware.h"
-#include "switch.h"
 #include "controller.h"
 #include "text_parser.h"
-
-#ifdef __cplusplus
-extern "C"{
+#ifdef __ARM
+#include "UniqueId.h"
+#include "Reset.h"
+#endif
+#ifdef __AVR
+#include "xmega/xmega_init.h"
+#include "xmega/xmega_rtc.h"
 #endif
 
 /*
@@ -50,57 +53,42 @@ void hardware_init()
 }
 
 /*
- * _get_id() - get a human readable signature
- *
- *	Produce a unique deviceID based on the factory calibration data.
+ * hw_hard_reset() - reset system now
+ * hw_flash_loader() - enter flash loader to reflash board
  */
 
-void _get_id(char_t *id)
+void hw_hard_reset(void)
 {
-	return;
-}
- 
- /*
- * Hardware Reset Handlers
- *
- * hw_request_hard_reset()
- * hw_hard_reset()			- hard reset using watchdog timer
- * hw_hard_reset_handler()	- controller's rest handler
- */
-void hw_request_hard_reset() { cs.hard_reset_requested = true; }
-
-void hw_hard_reset(void)			// software hard reset using the watchdog timer
-{
-//	wdt_enable(WDTO_15MS);
-//	while (true);					// loops for about 15ms then resets
+    banzai(0);   // arg=0 resets the system
 }
 
-stat_t hw_hard_reset_handler(void)
+void hw_flash_loader(void)
 {
-	if (cs.hard_reset_requested == false) { return (STAT_NOOP);}
-	hw_hard_reset();				// hard reset - identical to hitting RESET button
-	return (STAT_EAGAIN);
+    banzai(1);  // arg=1 erases FLASH and enters FLASH loader
 }
 
 /*
- * Bootloader Handlers
+ * _get_id() - get a human readable signature
  *
- * hw_request_bootloader()
- * hw_request_bootloader_handler() - executes a software reset using CCPWrite
+ *	Produce a unique deviceID based on the factory calibration data.
+ *	Truncate to SYS_ID_DIGITS length
  */
 
-void hw_request_bootloader() { cs.bootloader_requested = true;}
-
-stat_t hw_bootloader_handler(void)
+void _get_id(char *id)
 {
-//	if (cs.bootloader_requested == false) { return (STAT_NOOP);}
-//	cli();
-//	CCPWrite(&RST.CTRL, RST_SWRST_bm);  // fire a software reset
-	return (STAT_EAGAIN);				// never gets here but keeps the compiler happy
+    char *p = id;
+    const uint16_t *uuid = readUniqueIdString();
+
+    for(uint8_t i=0; i<SYS_ID_DIGITS; i++) {
+        *p++ = uuid[i];
+        if ( (i & 0x03) == 3) {     // put a dash every 4 digits
+            *p++ = '-';
+        }
+    }
+    *(--p) = 0; // nul termination
 }
 
 /***** END OF SYSTEM FUNCTIONS *****/
-
 
 /***********************************************************************************
  * CONFIGURATION AND INTERFACE FUNCTIONS
@@ -111,28 +99,28 @@ stat_t hw_bootloader_handler(void)
  * hw_get_id() - get device ID (signature)
  */
 
-stat_t hw_get_id(cmdObj_t *cmd) 
+stat_t hw_get_id(nvObj_t *nv)
 {
-//	char_t tmp[SYS_ID_LEN];
-//	_get_id(tmp);
-//	cmd->objtype = TYPE_STRING;
-//	ritorno(cmd_copy_string(cmd, tmp));
+	char tmp[SYS_ID_LEN];
+	_get_id(tmp);
+	nv->valuetype = TYPE_STRING;
+	ritorno(nv_copy_string(nv, tmp));
 	return (STAT_OK);
 }
 
 /*
- * hw_run_boot() - invoke boot form the cfgArray
+ * hw_flash() - invoke FLASH loader from command input
  */
-stat_t hw_run_boot(cmdObj_t *cmd)
+stat_t hw_flash(nvObj_t *nv)
 {
-	hw_request_bootloader();
+    hw_flash_loader();
 	return(STAT_OK);
 }
 
 /*
  * hw_set_hv() - set hardware version number
  */
-stat_t hw_set_hv(cmdObj_t *cmd) 
+stat_t hw_set_hv(nvObj_t *nv)
 {
 	return (STAT_OK);
 }
@@ -147,18 +135,16 @@ stat_t hw_set_hv(cmdObj_t *cmd)
 
 static const char fmt_fb[] PROGMEM = "[fb]  firmware build%18.2f\n";
 static const char fmt_fv[] PROGMEM = "[fv]  firmware version%16.2f\n";
+static const char fmt_cv[] PROGMEM = "[cv]  configuration version%11.2f\n";
 static const char fmt_hp[] PROGMEM = "[hp]  hardware platform%15.2f\n";
 static const char fmt_hv[] PROGMEM = "[hv]  hardware version%16.2f\n";
-static const char fmt_id[] PROGMEM = "[id]  TinyG ID%30s\n";
+static const char fmt_id[] PROGMEM = "[id]  TinyG ID%21s\n";
 
-void hw_print_fb(cmdObj_t *cmd) { text_print_flt(cmd, fmt_fb);}
-void hw_print_fv(cmdObj_t *cmd) { text_print_flt(cmd, fmt_fv);}
-void hw_print_hp(cmdObj_t *cmd) { text_print_flt(cmd, fmt_hp);}
-void hw_print_hv(cmdObj_t *cmd) { text_print_flt(cmd, fmt_hv);}
-void hw_print_id(cmdObj_t *cmd) { text_print_str(cmd, fmt_id);}
+void hw_print_fb(nvObj_t *nv) { text_print(nv, fmt_fb);}    // TYPE_FLOAT
+void hw_print_fv(nvObj_t *nv) { text_print(nv, fmt_fv);}    // TYPE_FLOAT
+void hw_print_cv(nvObj_t *nv) { text_print(nv, fmt_cv);}    // TYPE_FLOAT
+void hw_print_hp(nvObj_t *nv) { text_print(nv, fmt_hp);}    // TYPE_FLOAT
+void hw_print_hv(nvObj_t *nv) { text_print(nv, fmt_hv);}    // TYPE_FLOAT
+void hw_print_id(nvObj_t *nv) { text_print(nv, fmt_id);}    // TYPE_STRING
 
-#endif //__TEXT_MODE 
-
-#ifdef __cplusplus
-}
-#endif
+#endif //__TEXT_MODE

@@ -74,10 +74,11 @@ endif
 GCC_TOOLCHAIN = gcc
 
 # Toolchain prefix when cross-compiling
-CROSS_COMPILE = arm-none-eabi-
+CROSS_COMPILE = arm-none-eabi
 
 # Defines which are the available memory targets for the device.
-MEMORIES = sram flash
+//MEMORIES = sram flash
+MEMORIES = flash
 
 CMSIS_PATH  = $(CMSIS_ROOT)/CMSIS/Include
 SAM_PATH    = $(CMSIS_ROOT)/Device/ATMEL
@@ -86,7 +87,7 @@ DEVICE_PATH = $(SAM_PATH)/$(SERIES)/source
 SAM_SOURCE_DIRS += $(DEVICE_PATH)
 SAM_SOURCE_DIRS += $(DEVICE_PATH)/$(GCC_TOOLCHAIN)
 SAM_SOURCE_DIRS += platform/atmel_sam
-FIRST_LINK_SOURCES += platform/atmel_sam/syscalls_sam3.c
+DEVICE_FIRST_LINK_SOURCES += platform/atmel_sam/syscalls_sam3.c
 
 DEVICE_RULES = $(call CREATE_DEVICE_LIBRARY,SAM,cmsis_sam)
 
@@ -94,13 +95,25 @@ DEVICE_RULES = $(call CREATE_DEVICE_LIBRARY,SAM,cmsis_sam)
 DEVICE_INCLUDE_DIRS += "$(CMSIS_PATH)"
 DEVICE_INCLUDE_DIRS += "$(SAM_PATH)"
 DEVICE_INCLUDE_DIRS += "$(SAM_PATH)/$(SERIES)/include"
-DEVICE_INCLUDE_DIRS += platform/atmel_sam
+DEVICE_INCLUDE_DIRS += ./platform/atmel_sam
 
 DEVICE_LIBS          = gcc c
 
-# FIXME: Assumes all sams are Dues
-VARIANT=arduino_due_x
-CFLAGS   += -D__$(CHIP)__ -D$(VARIANT)
-CPPFLAGS += -D__$(CHIP)__ -D$(VARIANT)
+# ---------------------------------------------------------------------------------------
+# C Flags (NOT CPP flags)
 
-ASFLAGS  += -mcpu=cortex-m3 -mthumb 
+DEVICE_CFLAGS := -D__$(CHIP)__ --param max-inline-insns-single=500 -mcpu=cortex-m3 -mthumb -mlong-calls -ffunction-sections -fdata-sections -nostdlib -std=gnu99 -u _printf_float
+
+
+# ---------------------------------------------------------------------------------------
+# CPP Flags
+
+DEVICE_CPPFLAGS := -D__$(CHIP)__ --param max-inline-insns-single=500 -mcpu=cortex-m3 -mthumb -mlong-calls -ffunction-sections -fdata-sections -fno-rtti -std=c++11 -fno-exceptions -u _printf_float
+
+# ---------------------------------------------------------------------------------------
+# Linker Flags
+
+DEVICE_LDFLAGS := -nostartfiles -mcpu=cortex-m3 --specs=nano.specs  -u _printf_float  -mthumb 
+
+DEVICE_ASFLAGS  := -D__$(CHIP)__ -mcpu=cortex-m3 -mthumb
+

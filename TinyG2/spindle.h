@@ -2,7 +2,7 @@
  * spindle.h - spindle driver
  * This file is part of the TinyG project
  *
- * Copyright (c) 2010 - 2013 Alden S. Hart, Jr.
+ * Copyright (c) 2010 - 2015 Alden S. Hart, Jr.
  *
  * This file ("the software") is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2 as published by the
@@ -28,24 +28,100 @@
 #ifndef SPINDLE_H_ONCE
 #define SPINDLE_H_ONCE
 
-#ifdef __cplusplus
-extern "C"{
-#endif
+typedef enum {				        // how spindle controls are presented by the Gcode parser
+    SPINDLE_CONTROL_OFF = 0,        // M5
+    SPINDLE_CONTROL_CW,             // M3
+    SPINDLE_CONTROL_CCW             // M4
+} cmSpindleControl;
+
+typedef enum {
+    SPINDLE_OFF = 0,
+    SPINDLE_ON,
+    SPINDLE_PAUSE                   // meaning it was on and now it's off
+} cmSpindleEnable;
+
+typedef enum {				        // spindle direction state
+    SPINDLE_CW = 0,
+    SPINDLE_CCW
+} cmSpindleDir;
+
+typedef enum {
+    SPINDLE_ACTIVE_LOW = 0,
+    SPINDLE_ACTIVE_HIGH
+} cmSpindlePolarity;
+
+typedef enum {
+    ESC_ONLINE = 0,
+    ESC_OFFLINE,
+    ESC_LOCKOUT,
+    ESC_REBOOTING,
+    ESC_LOCKOUT_AND_REBOOTING,
+} cmESCState;
+
+/*
+ * Spindle control structure
+ */
+
+typedef struct cmSpindleSingleton {
+
+    float speed;                        // S in RPM
+    cmSpindleEnable enable;             // OFF, ON, PAUSE
+    cmSpindleDir direction;             // CW, CCW
+
+    bool pause_on_hold;                 // pause on feedhold
+    cmSpindlePolarity enable_polarity;  // 0=active low, 1=active high
+    cmSpindlePolarity dir_polarity;     // 0=clockwise low, 1=clockwise high
+    float dwell_seconds;                // dwell on spindle resume
+
+//    float override_factor;            // 1.0000 x S spindle speed. Go up or down from there
+//    uint8_t override_enable;          // TRUE = override enabled
+
+    cmESCState esc_state;               // state management for ESC controller
+    uint32_t esc_boot_timer;            // When the ESC last booted up
+    uint32_t esc_lockout_timer;         // When the ESC lockout last triggered
+
+} cmSpindleton_t;
+extern cmSpindleton_t spindle;
 
 /*
  * Global Scope Functions
  */
 
-void cm_spindle_init();
+void spindle_init();
+void spindle_reset();
+stat_t cm_set_spindle_speed(float speed);			    // S parameter
+stat_t cm_spindle_control(uint8_t control);             // M3, M4, M5 integrated spindle control
+void cm_spindle_off_immediate(void);
+void cm_spindle_optional_pause(bool option);            // stop spindle based on system options selected
+void cm_spindle_resume(float dwell_seconds);            // restart spindle after pause based on previous state
 
-stat_t cm_set_spindle_speed(float speed);			// S parameter
-void cm_exec_spindle_speed(float speed);			// callback for above
+//stat_t cm_spindle_override_enable(uint8_t flag);    // M51
+//stat_t cm_spindle_override_factor(uint8_t flag);    // M51.1
 
-stat_t cm_spindle_control(uint8_t spindle_mode);	// M3, M4, M5 integrated spindle control
-void cm_exec_spindle_control(uint8_t spindle_mode);	// callback for above
+stat_t cm_set_dir(nvObj_t *nv);
 
-#ifdef __cplusplus
-}
-#endif
+/*--- text_mode support functions ---*/
+
+#ifdef __TEXT_MODE
+
+    void cm_print_spep(nvObj_t *nv);
+    void cm_print_spdp(nvObj_t *nv);
+    void cm_print_spph(nvObj_t *nv);
+    void cm_print_spdw(nvObj_t *nv);
+    void cm_print_spe(nvObj_t *nv);
+    void cm_print_spd(nvObj_t *nv);
+    void cm_print_sps(nvObj_t *nv);
+
+#else
+
+    #define cm_print_spep tx_print_stub
+    #define cm_print_spdp tx_print_stub
+    #define cm_print_spph tx_print_stub
+    #define cm_print_spdw tx_print_stub
+    #define cm_print_spe tx_print_stub
+    #define cm_print_spd tx_print_stub
+    #define cm_print_sps tx_print_stub
+
+#endif // __TEXT_MODE
 
 #endif	// End of include guard: SPINDLE_H_ONCE

@@ -2,8 +2,8 @@
  * main.cpp - TinyG - An embedded rs274/ngc CNC controller
  * This file is part of the TinyG project.
  *
- * Copyright (c) 2010 - 2013 Alden S. Hart, Jr.
- * Copyright (c) 2013 Robert Giseburt
+ * Copyright (c) 2010 - 2015 Alden S. Hart, Jr.
+ * Copyright (c) 2013 - 2015 Robert Giseburt
  *
  * This file ("the software") is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License, version 2 as published by the
@@ -17,44 +17,59 @@
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF
  * OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-/* See github.com/Synthetos/G2 for code and docs on the wiki 
+/* See github.com/Synthetos/G2 for code and docs on the wiki
  */
 
-#include "tinyg2.h"				// #1 There are some dependencies
-#include "config.h"				// #2
+#include "tinyg2.h"					// #1 There are some dependencies
+#include "config.h"					// #2
 #include "hardware.h"
+#include "persistence.h"
 #include "controller.h"
 #include "canonical_machine.h"
+#include "json_parser.h"			// required for unit tests only
 #include "report.h"
 #include "planner.h"
 #include "stepper.h"
-//#include "network.h"
-#include "switch.h"
-//#include "gpio.h"
-//#include "test.h"
+#include "encoder.h"
+#include "spindle.h"
+#include "gpio.h"
+#include "test.h"
 #include "pwm.h"
 #include "xio.h"
 
+#ifdef __AVR
+#include <avr/interrupt.h>
+#include "xmega/xmega_interrupts.h"
+#endif // __AVR
+
+#ifdef __ARM
+#include "UniqueId.h"
 #include "MotateTimers.h"
 using Motate::delay;
 
+/**************************
+ *** C++ specific stuff ***
+ **************************/
 #ifdef __cplusplus
 extern "C"{
 #endif // __cplusplus
 
 void _init() __attribute__ ((weak));
 void _init() {;}
-
 void __libc_init_array(void);
 
 #ifdef __cplusplus
 }
 #endif // __cplusplus
+/************************** to here ***************************/
 
-static void _application_init(void);
+void* __dso_handle = nullptr;
+
+#endif // __ARM
 
 /******************** Application Code ************************/
 
+#ifdef __ARM
 const Motate::USBSettings_t Motate::USBSettings = {
 	/*gVendorID         = */ 0x1d50,
 	/*gProductID        = */ 0x606d,
@@ -64,38 +79,101 @@ const Motate::USBSettings_t Motate::USBSettings = {
 };
 	/*gProductVersion   = */ //0.1,
 
-Motate::USBDevice< Motate::USBCDC > usb;
-//Motate::USBDevice< Motate::USBCDC, Motate::USBCDC > usb;
+//Motate::USBDevice< Motate::USBCDC > usb;
+Motate::USBDevice< Motate::USBCDC, Motate::USBCDC > usb;
 
-typeof usb._mixin_0_type::Serial &SerialUSB = usb._mixin_0_type::Serial;
-//typeof usb._mixin_1_type::Serial &SerialUSB1 = usb._mixin_1_type::Serial;
+decltype(usb._mixin_0_type::Serial) &SerialUSB = usb._mixin_0_type::Serial;
+decltype(usb._mixin_1_type::Serial) &SerialUSB1 = usb._mixin_1_type::Serial;
 
 MOTATE_SET_USB_VENDOR_STRING( {'S' ,'y', 'n', 't', 'h', 'e', 't', 'o', 's'} )
 MOTATE_SET_USB_PRODUCT_STRING( {'T', 'i', 'n', 'y', 'G', ' ', 'v', '2'} )
+MOTATE_SET_USB_SERIAL_NUMBER_STRING_FROM_CHIPID()
 
-void init(void)
+//Motate::SPI<kSocket4_SPISlaveSelectPinNumber> spi;
+#endif
+
+/*
+ * _system_init()
+ * _application_init_services()
+ * _application_init_machine()
+ * _application_init_startup()
+ *
+ * There are a lot of dependencies in the order of these inits.
+ * Don't change the ordering unless you understand this.
+ */
+
+void _system_init(void)
 {
 #ifdef __ARM
 	SystemInit();
-
-	// Disable watchdog
-	WDT->WDT_MR = WDT_MR_WDDIS;
-
-	// Initialize C library
-	__libc_init_array();
+	WDT->WDT_MR = WDT_MR_WDDIS;     // Disable watchdog
+	__libc_init_array();            // Initialize C library
+    cacheUniqueId();                // Store the flash UUID
+	usb.attach();                   // USB setup
+	delay(1000);
+#endif
+#ifdef __AVR
+    cli();
 #endif
 }
+
+void application_init_services(void)
+{
+	hardware_init();				// system hardware setup 			- must be first
+	persistence_init();				// set up EEPROM or other NVM		- must be second
+	xio_init();						// xtended io subsystem				- must be third
+//	rtc_init();						// real time counter
+}
+
+void application_init_machine(void)
+{
+	cm.machine_state = MACHINE_INITIALIZING;
+//    controller_init(STD_IN, STD_OUT, STD_ERR);  // should be first machine init (requires xio_init())
+
+    stepper_init();                 // stepper subsystem (must precede gpio_init() on AVR)
+    encoder_init();                 // virtual encoders
+    gpio_init();                    // inputs and outputs
+    pwm_init();                     // pulse width modulation drivers
+//    controller_init(STD_IN, STD_OUT, STD_ERR);// must be first app init; reqs xio_init()
+    planner_init();                 // motion planning subsystem
+    canonical_machine_init();       // canonical machine
+//    spindle_init();                 // should be after PWM and canonical machine inits
+}
+
+void application_init_startup(void)
+{
+#ifdef __AVR
+    // now bring up the interrupts and get started
+    PMIC_SetVectorLocationToApplication();// as opposed to boot ROM
+    PMIC_EnableHighLevel();			// all levels are used, so don't bother to abstract them
+    PMIC_EnableMediumLevel();
+    PMIC_EnableLowLevel();
+    sei();							// enable global interrupts
+#endif
+
+    // start the application
+    controller_init(STD_IN, STD_OUT, STD_ERR);  // should be first startup init (requires xio_init())
+    config_init();					// apply the config settings from persistence
+    canonical_machine_reset();
+    spindle_init();                 // should be after PWM and canonical machine inits and config_init()
+    spindle_reset();
+    // MOVED: report the system is ready is now in xio
+}
+
+/*
+ * main()
+ */
 
 int main(void)
 {
 	// system initialization
-	init();
-	delay(1);
-	usb.attach();					// USB setup
-	delay(1000);
+	_system_init();
 
 	// TinyG application setup
-	_application_init();
+	application_init_services();
+	application_init_machine();
+	application_init_startup();
+	run_canned_startup();			// run any pre-loaded commands
 
 	// main loop
 	for (;;) {
@@ -104,70 +182,43 @@ int main(void)
 	return 0;
 }
 
-static void _application_init(void)
-{
-	// There are a lot of dependencies in the order of these inits.
-	// Don't change the ordering unless you understand this.
-
-	// do these first
-	hardware_init();				// system hardware setup 			- must be first
-	config_init();					// config records from eeprom 		- must be second
-	switch_init();					// switches and other inputs
-	pwm_init();						// pulse width modulation drivers
-
-	// do these next
-	controller_init( DEV_STDIN, DEV_STDOUT, DEV_STDERR );
-	planner_init();					// motion planning subsystem
-	canonical_machine_init();		// canonical machine				- must follow config_init()
-
-	// do these last
-	stepper_init();
-
-	// now get started
-//	rpt_print_system_ready_message();// (LAST) announce system is ready
-//	_unit_tests();					// run any unit tests that are enabled
-//	tg_canned_startup();			// run any pre-loaded commands
-	return;
-}
-
-void tg_reset(void)			// software hard reset using the watchdog timer
-{
-	//	wdt_enable(WDTO_15MS);
-	//	while (true);			// loops for about 15ms then resets
-}
-
 /**** Status Messages ***************************************************************
  * get_status_message() - return the status message
  *
  * See tinyg.h for status codes. These strings must align with the status codes in tinyg.h
- * The number of elements in the indexing array must match the # of strings
+ * The number of elements in the indexing array must match the # of strings.
+ *
+ * These strings are here even if text mode is disabled in order to support exception reports.
  *
  * Reference for putting display strings and string arrays in AVR program memory:
  * http://www.cs.mun.ca/~paul/cs4723/material/atmel/avr-libc-user-manual-1.6.5/pgmspace.html
  */
 
-stat_t status_code;						// allocate a variable for this macro
-char shared_buf[STATUS_MESSAGE_LEN];	// allocate string for global use
+stat_t status_code;						// allocate a variable for the ritorno macro
+char global_string_buf[MESSAGE_LEN];	// allocate a string for global message use
+
+/*** Status message strings ***/
 
 static const char stat_00[] PROGMEM = "OK";
 static const char stat_01[] PROGMEM = "Error";
 static const char stat_02[] PROGMEM = "Eagain";
 static const char stat_03[] PROGMEM = "Noop";
 static const char stat_04[] PROGMEM = "Complete";
-static const char stat_05[] PROGMEM = "Terminated";
-static const char stat_06[] PROGMEM = "Hard reset";
+static const char stat_05[] PROGMEM = "Shutdown";
+static const char stat_06[] PROGMEM = "Panic";
 static const char stat_07[] PROGMEM = "End of line";
 static const char stat_08[] PROGMEM = "End of file";
 static const char stat_09[] PROGMEM = "File not open";
+
 static const char stat_10[] PROGMEM = "Max file size exceeded";
 static const char stat_11[] PROGMEM = "No such device";
 static const char stat_12[] PROGMEM = "Buffer empty";
 static const char stat_13[] PROGMEM = "Buffer full";
-static const char stat_14[] PROGMEM = "Buffer full - fatal";
+static const char stat_14[] PROGMEM = "Buffer full FATAL";
 static const char stat_15[] PROGMEM = "Initializing";
 static const char stat_16[] PROGMEM = "Entering boot loader";
 static const char stat_17[] PROGMEM = "Function is stubbed";
-static const char stat_18[] PROGMEM = "18";
+static const char stat_18[] PROGMEM = "Alarm";
 static const char stat_19[] PROGMEM = "19";
 
 static const char stat_20[] PROGMEM = "Internal error";
@@ -177,33 +228,34 @@ static const char stat_23[] PROGMEM = "Divide by zero";
 static const char stat_24[] PROGMEM = "Invalid Address";
 static const char stat_25[] PROGMEM = "Read-only address";
 static const char stat_26[] PROGMEM = "Initialization failure";
-static const char stat_27[] PROGMEM = "System alarm - shutting down";
-static const char stat_28[] PROGMEM = "Memory fault or corruption";
-static const char stat_29[] PROGMEM = "29";
-static const char stat_30[] PROGMEM = "30";
-static const char stat_31[] PROGMEM = "31";
-static const char stat_32[] PROGMEM = "32";
-static const char stat_33[] PROGMEM = "33";
-static const char stat_34[] PROGMEM = "34";
-static const char stat_35[] PROGMEM = "35";
+static const char stat_27[] PROGMEM = "27";
+static const char stat_28[] PROGMEM = "Failed to get planner buffer";
+static const char stat_29[] PROGMEM = "Generic exception report";
+
+static const char stat_30[] PROGMEM = "Move time is infinite";
+static const char stat_31[] PROGMEM = "Move time is NAN";
+static const char stat_32[] PROGMEM = "Float is infinite";
+static const char stat_33[] PROGMEM = "Float is NAN";
+static const char stat_34[] PROGMEM = "Persistence error";
+static const char stat_35[] PROGMEM = "Bad status report setting";
 static const char stat_36[] PROGMEM = "36";
 static const char stat_37[] PROGMEM = "37";
 static const char stat_38[] PROGMEM = "38";
 static const char stat_39[] PROGMEM = "39";
 
-static const char stat_40[] PROGMEM = "Unrecognized command";
-static const char stat_41[] PROGMEM = "Expected command letter";
-static const char stat_42[] PROGMEM = "Bad number format";
-static const char stat_43[] PROGMEM = "Input exceeds max length";
-static const char stat_44[] PROGMEM = "Input value too small";
-static const char stat_45[] PROGMEM = "Input value too large";
-static const char stat_46[] PROGMEM = "Input value range error";
-static const char stat_47[] PROGMEM = "Input value unsupported";
-static const char stat_48[] PROGMEM = "JSON syntax error";
-static const char stat_49[] PROGMEM = "JSON input has too many pairs";	// current longest message: 30 chars
-static const char stat_50[] PROGMEM = "JSON output too long";
-static const char stat_51[] PROGMEM = "Out of buffer space";
-static const char stat_52[] PROGMEM = "Config rejected during cycle";
+static const char stat_40[] PROGMEM = "40";
+static const char stat_41[] PROGMEM = "41";
+static const char stat_42[] PROGMEM = "42";
+static const char stat_43[] PROGMEM = "43";
+static const char stat_44[] PROGMEM = "44";
+static const char stat_45[] PROGMEM = "45";
+static const char stat_46[] PROGMEM = "46";
+static const char stat_47[] PROGMEM = "47";
+static const char stat_48[] PROGMEM = "48";
+static const char stat_49[] PROGMEM = "49";
+static const char stat_50[] PROGMEM = "50";
+static const char stat_51[] PROGMEM = "51";
+static const char stat_52[] PROGMEM = "52";
 static const char stat_53[] PROGMEM = "53";
 static const char stat_54[] PROGMEM = "54";
 static const char stat_55[] PROGMEM = "55";
@@ -211,21 +263,20 @@ static const char stat_56[] PROGMEM = "56";
 static const char stat_57[] PROGMEM = "57";
 static const char stat_58[] PROGMEM = "58";
 static const char stat_59[] PROGMEM = "59";
-
-static const char stat_60[] PROGMEM = "Move less than minimum length";
-static const char stat_61[] PROGMEM = "Move less than minimum time";
-static const char stat_62[] PROGMEM = "Gcode block skipped";
-static const char stat_63[] PROGMEM = "Gcode input error";
-static const char stat_64[] PROGMEM = "Gcode feedrate error";
-static const char stat_65[] PROGMEM = "Gcode axis word missing";
-static const char stat_66[] PROGMEM = "Gcode modal group violation";
-static const char stat_67[] PROGMEM = "Homing cycle failed";
-static const char stat_68[] PROGMEM = "Max travel exceeded";
-static const char stat_69[] PROGMEM = "Max spindle speed exceeded";
-static const char stat_70[] PROGMEM = "Arc specification error";
-static const char stat_71[] PROGMEM = "Soft limit exceeded";
-static const char stat_72[] PROGMEM = "Command not accepted";
-static const char stat_73[] PROGMEM = "Probing cycle failed";
+static const char stat_60[] PROGMEM = "60";
+static const char stat_61[] PROGMEM = "61";
+static const char stat_62[] PROGMEM = "62";
+static const char stat_63[] PROGMEM = "63";
+static const char stat_64[] PROGMEM = "64";
+static const char stat_65[] PROGMEM = "65";
+static const char stat_66[] PROGMEM = "66";
+static const char stat_67[] PROGMEM = "67";
+static const char stat_68[] PROGMEM = "68";
+static const char stat_69[] PROGMEM = "69";
+static const char stat_70[] PROGMEM = "70";
+static const char stat_71[] PROGMEM = "71";
+static const char stat_72[] PROGMEM = "72";
+static const char stat_73[] PROGMEM = "73";
 static const char stat_74[] PROGMEM = "74";
 static const char stat_75[] PROGMEM = "75";
 static const char stat_76[] PROGMEM = "76";
@@ -240,28 +291,189 @@ static const char stat_84[] PROGMEM = "84";
 static const char stat_85[] PROGMEM = "85";
 static const char stat_86[] PROGMEM = "86";
 static const char stat_87[] PROGMEM = "87";
-static const char stat_88[] PROGMEM = "88";
-static const char stat_89[] PROGMEM = "89";
-static const char stat_90[] PROGMEM = "90";
-static const char stat_91[] PROGMEM = "91";
-static const char stat_92[] PROGMEM = "92";
-static const char stat_93[] PROGMEM = "93";
-static const char stat_94[] PROGMEM = "94";
-static const char stat_95[] PROGMEM = "95";
-static const char stat_96[] PROGMEM = "96";
-static const char stat_97[] PROGMEM = "97";
-static const char stat_98[] PROGMEM = "98";
-static const char stat_99[] PROGMEM = "99";
 
-static const char stat_100[] PROGMEM = "Generic assertion failure";
-static const char stat_101[] PROGMEM = "Generic exception report";
-static const char stat_102[] PROGMEM = "Memory fault detected";
-static const char stat_103[] PROGMEM = "Stack overflow detected";
-static const char stat_104[] PROGMEM = "Controller assertion failure";
-static const char stat_105[] PROGMEM = "Canonical machine assertion failure";
-static const char stat_106[] PROGMEM = "Planner assertion failure";
-static const char stat_107[] PROGMEM = "Stepper assertion failure";
-static const char stat_108[] PROGMEM = "Extended IO assertion failure";
+static const char stat_88[] PROGMEM = "Buffer free assertion failure";
+static const char stat_89[] PROGMEM = "State management assertion failure";
+static const char stat_90[] PROGMEM = "Config assertion failure";
+static const char stat_91[] PROGMEM = "XIO assertion failure";
+static const char stat_92[] PROGMEM = "Encoder assertion failure";
+static const char stat_93[] PROGMEM = "Stepper assertion failure";
+static const char stat_94[] PROGMEM = "Planner assertion failure";
+static const char stat_95[] PROGMEM = "Canonical machine assertion failure";
+static const char stat_96[] PROGMEM = "Controller assertion failure";
+static const char stat_97[] PROGMEM = "Stack overflow detected";
+static const char stat_98[] PROGMEM = "Memory fault detected";
+static const char stat_99[] PROGMEM = "Generic assertion failure";
+
+static const char stat_100[] PROGMEM = "Unrecognized command or config name";
+static const char stat_101[] PROGMEM = "Malformed command";
+static const char stat_102[] PROGMEM = "Bad number format";
+static const char stat_103[] PROGMEM = "Input exceeds max length";
+static const char stat_104[] PROGMEM = "Input value too small";
+static const char stat_105[] PROGMEM = "Input value too large";
+static const char stat_106[] PROGMEM = "Input value range error";
+static const char stat_107[] PROGMEM = "Input value unsupported";
+static const char stat_108[] PROGMEM = "JSON syntax error";
+static const char stat_109[] PROGMEM = "JSON input has too many pairs";
+
+static const char stat_110[] PROGMEM = "JSON output too long";
+static const char stat_111[] PROGMEM = "Config not taken during cycle";
+static const char stat_112[] PROGMEM = "Command cannot be taken at this time";
+static const char stat_113[] PROGMEM = "113";
+static const char stat_114[] PROGMEM = "114";
+static const char stat_115[] PROGMEM = "115";
+static const char stat_116[] PROGMEM = "116";
+static const char stat_117[] PROGMEM = "117";
+static const char stat_118[] PROGMEM = "118";
+static const char stat_119[] PROGMEM = "119";
+
+static const char stat_120[] PROGMEM = "120";
+static const char stat_121[] PROGMEM = "121";
+static const char stat_122[] PROGMEM = "122";
+static const char stat_123[] PROGMEM = "123";
+static const char stat_124[] PROGMEM = "124";
+static const char stat_125[] PROGMEM = "125";
+static const char stat_126[] PROGMEM = "126";
+static const char stat_127[] PROGMEM = "127";
+static const char stat_128[] PROGMEM = "128";
+static const char stat_129[] PROGMEM = "129";
+
+static const char stat_130[] PROGMEM = "Generic Gcode input error";
+static const char stat_131[] PROGMEM = "Gcode command unsupported";
+static const char stat_132[] PROGMEM = "M code unsupported";
+static const char stat_133[] PROGMEM = "Gcode modal group violation";
+static const char stat_134[] PROGMEM = "Axis word missing";
+static const char stat_135[] PROGMEM = "Axis cannot be present";
+static const char stat_136[] PROGMEM = "Axis invalid for this command";
+static const char stat_137[] PROGMEM = "Axis disabled";
+static const char stat_138[] PROGMEM = "Axis target position missing";
+static const char stat_139[] PROGMEM = "Axis target position invalid";
+
+static const char stat_140[] PROGMEM = "Selected plane missing";
+static const char stat_141[] PROGMEM = "Selected plane invalid";
+static const char stat_142[] PROGMEM = "Feedrate not specified";
+static const char stat_143[] PROGMEM = "Inverse time mode cannot be used with this command";
+static const char stat_144[] PROGMEM = "Rotary axes cannot be used with this command";
+static const char stat_145[] PROGMEM = "G0 or G1 must be active for G53";
+static const char stat_146[] PROGMEM = "Requested velocity exceeds limits";
+static const char stat_147[] PROGMEM = "Cutter compensation cannot be enabled";
+static const char stat_148[] PROGMEM = "Programmed point same as current point";
+static const char stat_149[] PROGMEM = "Spindle speed below minimum";
+
+static const char stat_150[] PROGMEM = "Spindle speed exceeded maximum";
+static const char stat_151[] PROGMEM = "Spindle S word is missing";
+static const char stat_152[] PROGMEM = "Spindle S word is invalid";
+static const char stat_153[] PROGMEM = "Spindle must be off for this command";
+static const char stat_154[] PROGMEM = "Spindle must be turning for this command";
+static const char stat_155[] PROGMEM = "Arc specification error";
+static const char stat_156[] PROGMEM = "Arc specification error - missing axis(es)";
+static const char stat_157[] PROGMEM = "Arc specification error - missing offset(s)";
+//--------------------------------------1--------10--------20--------30--------40--------50--------60-64
+static const char stat_158[] PROGMEM = "Arc specification error - radius arc out of tolerance";
+static const char stat_159[] PROGMEM = "Arc specification error - endpoint is starting point";
+
+static const char stat_160[] PROGMEM = "P word missing";
+static const char stat_161[] PROGMEM = "P word invalid";
+static const char stat_162[] PROGMEM = "P word zero";
+static const char stat_163[] PROGMEM = "P word negative";
+static const char stat_164[] PROGMEM = "P word not an integer";
+static const char stat_165[] PROGMEM = "P word not a valid tool number";
+static const char stat_166[] PROGMEM = "D word missing";
+static const char stat_167[] PROGMEM = "D word invalid";
+static const char stat_168[] PROGMEM = "E word missing";
+static const char stat_169[] PROGMEM = "E word invalid";
+
+static const char stat_170[] PROGMEM = "H word missing";
+static const char stat_171[] PROGMEM = "H word invalid";
+static const char stat_172[] PROGMEM = "L word missing";
+static const char stat_173[] PROGMEM = "L word invalid";
+static const char stat_174[] PROGMEM = "Q word missing";
+static const char stat_175[] PROGMEM = "Q word invalid";
+static const char stat_176[] PROGMEM = "R word missing";
+static const char stat_177[] PROGMEM = "R word invalid";
+static const char stat_178[] PROGMEM = "T word missing";
+static const char stat_179[] PROGMEM = "T word invalid";
+
+static const char stat_180[] PROGMEM = "180";
+static const char stat_181[] PROGMEM = "181";
+static const char stat_182[] PROGMEM = "182";
+static const char stat_183[] PROGMEM = "183";
+static const char stat_184[] PROGMEM = "184";
+static const char stat_185[] PROGMEM = "185";
+static const char stat_186[] PROGMEM = "186";
+static const char stat_187[] PROGMEM = "187";
+static const char stat_188[] PROGMEM = "188";
+static const char stat_189[] PROGMEM = "189";
+
+static const char stat_190[] PROGMEM = "190";
+static const char stat_191[] PROGMEM = "191";
+static const char stat_192[] PROGMEM = "192";
+static const char stat_193[] PROGMEM = "193";
+static const char stat_194[] PROGMEM = "194";
+static const char stat_195[] PROGMEM = "195";
+static const char stat_196[] PROGMEM = "196";
+static const char stat_197[] PROGMEM = "197";
+static const char stat_198[] PROGMEM = "198";
+static const char stat_199[] PROGMEM = "199";
+
+static const char stat_200[] PROGMEM = "Generic error";
+static const char stat_201[] PROGMEM = "Move < min length";
+static const char stat_202[] PROGMEM = "Move < min time";
+//--------------------------------------1--------10--------20--------30--------40--------50--------60-64
+static const char stat_203[] PROGMEM = "Limit hit [$clear to reset, $lim=0 to override]";
+static const char stat_204[] PROGMEM = "Command rejected by ALARM [$clear to reset]";
+static const char stat_205[] PROGMEM = "Command rejected by SHUTDOWN [$clear to reset]";
+static const char stat_206[] PROGMEM = "Command rejected by PANIC [^x to reset]";
+static const char stat_207[] PROGMEM = "Kill job";
+static const char stat_208[] PROGMEM = "208";
+static const char stat_209[] PROGMEM = "209";
+
+static const char stat_210[] PROGMEM = "210";
+static const char stat_211[] PROGMEM = "211";
+static const char stat_212[] PROGMEM = "212";
+static const char stat_213[] PROGMEM = "213";
+static const char stat_214[] PROGMEM = "214";
+static const char stat_215[] PROGMEM = "215";
+static const char stat_216[] PROGMEM = "216";
+static const char stat_217[] PROGMEM = "217";
+static const char stat_218[] PROGMEM = "218";
+static const char stat_219[] PROGMEM = "219";
+
+static const char stat_220[] PROGMEM = "Soft limit";
+static const char stat_221[] PROGMEM = "Soft limit - X min";
+static const char stat_222[] PROGMEM = "Soft limit - X max";
+static const char stat_223[] PROGMEM = "Soft limit - Y min";
+static const char stat_224[] PROGMEM = "Soft limit - Y max";
+static const char stat_225[] PROGMEM = "Soft limit - Z min";
+static const char stat_226[] PROGMEM = "Soft limit - Z max";
+static const char stat_227[] PROGMEM = "Soft limit - A min";
+static const char stat_228[] PROGMEM = "Soft limit - A max";
+static const char stat_229[] PROGMEM = "Soft limit - B min";
+static const char stat_230[] PROGMEM = "Soft limit - B max";
+static const char stat_231[] PROGMEM = "Soft limit - C min";
+static const char stat_232[] PROGMEM = "Soft limit - C max";
+static const char stat_233[] PROGMEM = "Soft limit during arc";
+static const char stat_234[] PROGMEM = "234";
+static const char stat_235[] PROGMEM = "235";
+static const char stat_236[] PROGMEM = "236";
+static const char stat_237[] PROGMEM = "237";
+static const char stat_238[] PROGMEM = "238";
+static const char stat_239[] PROGMEM = "239";
+
+static const char stat_240[] PROGMEM = "Homing cycle failed";
+static const char stat_241[] PROGMEM = "Homing Err - Bad or no axis specified";
+static const char stat_242[] PROGMEM = "Homing Err - Search velocity is zero";
+static const char stat_243[] PROGMEM = "Homing Err - Latch velocity is zero";
+static const char stat_244[] PROGMEM = "Homing Err - Travel min & max are the same";
+static const char stat_245[] PROGMEM = "Homing Err - Negative latch backoff";
+static const char stat_246[] PROGMEM = "Homing Err - Homing input is misconfigured";
+static const char stat_247[] PROGMEM = "Homing Err - Must clear switches before homing";
+static const char stat_248[] PROGMEM = "248";
+static const char stat_249[] PROGMEM = "249";
+
+static const char stat_250[] PROGMEM = "Probe cycle failed";
+static const char stat_251[] PROGMEM = "Probe endpoint is starting point";
+static const char stat_252[] PROGMEM = "Jogging cycle failed";
 
 static const char *const stat_msg[] PROGMEM = {
 	stat_00, stat_01, stat_02, stat_03, stat_04, stat_05, stat_06, stat_07, stat_08, stat_09,
@@ -274,28 +486,25 @@ static const char *const stat_msg[] PROGMEM = {
 	stat_70, stat_71, stat_72, stat_73, stat_74, stat_75, stat_76, stat_77, stat_78, stat_79,
 	stat_80, stat_81, stat_82, stat_83, stat_84, stat_85, stat_86, stat_87, stat_88, stat_89,
 	stat_90, stat_91, stat_92, stat_93, stat_94, stat_95, stat_96, stat_97, stat_98, stat_99,
-	stat_100, stat_101, stat_102, stat_103, stat_104, stat_105, stat_106, stat_107, stat_108
+	stat_100, stat_101, stat_102, stat_103, stat_104, stat_105, stat_106, stat_107, stat_108, stat_109,
+	stat_110, stat_111, stat_112, stat_113, stat_114, stat_115, stat_116, stat_117, stat_118, stat_119,
+	stat_120, stat_121, stat_122, stat_123, stat_124, stat_125, stat_126, stat_127, stat_128, stat_129,
+	stat_130, stat_131, stat_132, stat_133, stat_134, stat_135, stat_136, stat_137, stat_138, stat_139,
+	stat_140, stat_141, stat_142, stat_143, stat_144, stat_145, stat_146, stat_147, stat_148, stat_149,
+	stat_150, stat_151, stat_152, stat_153, stat_154, stat_155, stat_156, stat_157, stat_158, stat_159,
+	stat_160, stat_161, stat_162, stat_163, stat_164, stat_165, stat_166, stat_167, stat_168, stat_169,
+	stat_170, stat_171, stat_172, stat_173, stat_174, stat_175, stat_176, stat_177, stat_178, stat_179,
+	stat_180, stat_181, stat_182, stat_183, stat_184, stat_185, stat_186, stat_187, stat_188, stat_189,
+	stat_190, stat_191, stat_192, stat_193, stat_194, stat_195, stat_196, stat_197, stat_198, stat_199,
+	stat_200, stat_201, stat_202, stat_203, stat_204, stat_205, stat_206, stat_207, stat_208, stat_209,
+	stat_210, stat_211, stat_212, stat_213, stat_214, stat_215, stat_216, stat_217, stat_218, stat_219,
+	stat_220, stat_221, stat_222, stat_223, stat_224, stat_225, stat_226, stat_227, stat_228, stat_229,
+	stat_230, stat_231, stat_232, stat_233, stat_234, stat_235, stat_236, stat_237, stat_238, stat_239,
+	stat_240, stat_241, stat_242, stat_243, stat_244, stat_245, stat_246, stat_247, stat_248, stat_249,
+	stat_250, stat_251, stat_252
 };
 
 char *get_status_message(stat_t status)
 {
 	return ((char *)GET_TEXT_ITEM(stat_msg, status));
-}
-
-/*******************************************************************************
- * _unit_tests() - uncomment __UNITS... line in .h files to enable unit tests
- */
-
-static void _unit_tests(void) 
-{
-#ifdef __UNIT_TESTS
-	XIO_UNITS;				// conditional unit tests for xio sub-system
-//	EEPROM_UNITS;			// if you want this you must include the .h file in this file
-	CONFIG_UNITS;
-	JSON_UNITS;
-	GPIO_UNITS;
-	REPORT_UNITS;
-	PLANNER_UNITS;
-	PWM_UNITS;
-#endif
 }
