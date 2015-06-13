@@ -1,6 +1,12 @@
 # TinyG 2
 
-This branch (`edge`) is for the adventurous. It is not guaranteed to be stable. It's not guaranteed AT ALL.
+Welcome to TinyG2, the next-generation of [Synthetos TinyG](https://github.com/synthetos/tinyg/) running on ARM processors.
+
+# Usage
+
+The use of the TinyG2 repo is mostly the same as that of [TinyG](https://github.com/synthetos/tinyg/wiki). This version is still in pre-release, however, and the documentation is still being written.
+
+For more information, please see the [G2 Wiki](https://github.com/synthetos/G2/wiki).
 
 # Build Instructions
 
