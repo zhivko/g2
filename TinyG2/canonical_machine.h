@@ -478,6 +478,7 @@ typedef struct cmAxis {
 	float recip_jerk;					// stored reciprocal of current jerk value - has the million in it
 	float junction_dev;					// aka cornering delta
 	float radius;						// radius in mm for rotary axis modes
+	float tool_length;     				// for {G43.1,G49}
 
     uint8_t homing_input;               // set 1-N for homing input. 0 will disable homing
     uint8_t homing_dir;                 // 0=search to negative, 1=search to positive
